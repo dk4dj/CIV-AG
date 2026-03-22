@@ -43,7 +43,7 @@
 
 // ─── CI-V UART ──────────────────────────────────────────────────────────────
 #define CIV_BAUD        19200    // Typisch 9600 oder 19200 – ggf. anpassen
-#define CIV_RX_PIN      5       // GPIO16 = UART2 RX  (am WT32-ETH01 frei verfügbar)
+#define CIV_RX_PIN      5       // GPIO5 = UART2 RX  (am WT32-ETH01 frei verfügbar)
 #define CIV_TX_PIN      17       // GPIO17 = UART2 TX
 // ACHTUNG: GPIO16 wird auch als ETH_POWER_PIN genutzt. Falls der LAN8720 keinen
 // separaten Power-Pin braucht, ETH_POWER_PIN auf -1 setzen.
