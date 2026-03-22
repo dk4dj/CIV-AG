@@ -43,7 +43,7 @@
 
 // ─── CI-V UART ──────────────────────────────────────────────────────────────
 #define CIV_BAUD        19200    // Typisch 9600 oder 19200 – ggf. anpassen
-#define CIV_RX_PIN      16       // GPIO16 = UART2 RX  (am WT32-ETH01 frei verfügbar)
+#define CIV_RX_PIN      5       // GPIO16 = UART2 RX  (am WT32-ETH01 frei verfügbar)
 #define CIV_TX_PIN      17       // GPIO17 = UART2 TX
 // ACHTUNG: GPIO16 wird auch als ETH_POWER_PIN genutzt. Falls der LAN8720 keinen
 // separaten Power-Pin braucht, ETH_POWER_PIN auf -1 setzen.
@@ -316,7 +316,7 @@ void setup() {
 
   // Ethernet initialisieren
   WiFi.onEvent(onEthEvent);
-  ETH.begin(ETH_ADDR, -1 /*ETH_POWER_PIN*/, ETH_MDC_PIN, ETH_MDIO_PIN,
+  ETH.begin(ETH_ADDR, ETH_POWER_PIN, ETH_MDC_PIN, ETH_MDIO_PIN,
             ETH_TYPE, ETH_CLK_MODE);
 
   // Bänder initialisieren
@@ -343,6 +343,12 @@ void setup() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 void loop() {
+  // Web-Server und SSE immer bedienen – unabhaengig vom AG/CIV-Status
+  if (ethConnected) {
+    webServer.handleClient();
+    handleSSEClient();
+  }
+
   if (!ethConnected) return;
 
   // 1. Antenna Genius suchen
@@ -367,9 +373,7 @@ void loop() {
   handleAGReceive();
   handleCIV();
   sendKeepalive();
-  pollPortStatus();   // aktives Port-Status-Polling (Fallback zu Status-Nachrichten)
-  webServer.handleClient();
-  handleSSEClient();  // SSE-Verbindung am Leben halten
+  pollPortStatus();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -443,7 +447,13 @@ void connectToAG() {
   if (!agClient.connect(agIP, AG_PORT)) {
     webLog("[AG] Verbindung fehlgeschlagen, neuer Versuch in 3 s");
     snprintf(agStatusStr, sizeof(agStatusStr), "Fehler");
-    delay(3000);
+    // Non-blocking warten: handleClient() laeuft weiter
+    uint32_t t = millis();
+    while (millis() - t < 3000) {
+      webServer.handleClient();
+      handleSSEClient();
+      delay(10);
+    }
     return;
   }
   agClient.setNoDelay(true);
