@@ -110,4 +110,10 @@ This project implements the [4O3A Antenna Genius API](https://github.com/4o3a/ge
 
 ## License
 
-MIT
+GPLv3
+
+---
+
+Built with help of Claude.ai
+
+
