@@ -56,6 +56,7 @@
 #define AG_PORT         9007
 #define AG_KEEPALIVE_MS 5000
 #define AG_RECONNECT_MS 5000
+#define AG_CFG_TIMEOUT_MS 5000  // max. Wartezeit pro Config-Schritt
 #define MAX_BANDS       16
 #define MAX_ANTENNAS    16
 #define AG_RADIO_PORT   1       // Radio-Port A = 1
@@ -96,12 +97,11 @@ struct AntennaEntry {
 // AG-Konfigurations-Einlese-Zustand (nicht-blockierend)
 enum AgConfigState {
   AGCFG_IDLE,
-  AGCFG_WAIT_SUB_PORT,
-  AGCFG_WAIT_SUB_ANTENNA,
-  AGCFG_WAIT_BAND_LIST,
-  AGCFG_WAIT_ANTENNA_LIST,
-  AGCFG_WAIT_PORT1,
-  AGCFG_WAIT_PORT2,
+  AGCFG_WAIT_SUB_PORT,      // warte auf Antwort von "sub port all"
+  AGCFG_WAIT_BAND_LIST,     // warte auf Antwort von "band list"
+  AGCFG_WAIT_ANTENNA_LIST,  // warte auf Antwort von "antenna list"
+  AGCFG_WAIT_PORT1,         // warte auf Antwort von "port get 1"
+  AGCFG_WAIT_PORT2,         // warte auf Antwort von "port get 2"
   AGCFG_DONE
 };
 
@@ -127,8 +127,9 @@ AntennaEntry antennas[MAX_ANTENNAS];
 uint8_t      antennaCount = 0;
 
 // AG nicht-blockierender Config-State
-static AgConfigState agCfgState  = AGCFG_IDLE;
-static uint8_t       agCfgSeq    = 0;   // Sequenznummer des laufenden Kommandos
+static AgConfigState agCfgState   = AGCFG_IDLE;
+static uint8_t       agCfgSeq     = 0;
+static uint32_t      agCfgTimeout = 0;  // Timeout-Zeitstempel pro Config-Schritt
 
 // Sequenznummer für AG-Kommandos (1–255)
 static uint8_t  agSeq    = 1;
@@ -167,13 +168,19 @@ static WiFiClient sseClient;
 static bool       sseConnected = false;
 
 // Live-Status-Felder
-static char civAddrStr[8]   = "---";
-static char civFreqStr[20]  = "---";
-static char agNameStr[48]   = "---";
-static char agSerialStr[24] = "---";
-static char agFwStr[16]     = "---";
-static char agIPStr[20]     = "---";
-static char agStatusStr[20] = "Suche...";
+static char civAddrStr[8]    = "---";
+static char civFreqStr[20]   = "---";
+static char agNameStr[48]    = "---";
+static char agSerialStr[24]  = "---";
+static char agFwStr[16]      = "---";
+static char agIPStr[20]      = "---";
+static char agStatusStr[20]  = "Suche...";
+// Discovery-Felder
+static uint16_t agTcpPort    = 0;
+static uint8_t  agPorts      = 0;    // Anzahl Radio-Ports
+static uint8_t  agAntennas   = 0;    // Anzahl Antennen-Ports
+static char     agModeStr[12]= "---";
+static uint32_t agUptime     = 0;    // Sekunden seit letztem Boot
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Forward Declarations
@@ -262,6 +269,11 @@ void ssePushStatus() {
   json += "\"agSerial\":\"" + String(agSerialStr) + "\",";
   json += "\"agFw\":\"" + String(agFwStr) + "\",";
   json += "\"agIP\":\"" + String(agIPStr) + "\",";
+  json += "\"agPort\":" + String(agTcpPort) + ",";
+  json += "\"agPorts\":" + String(agPorts) + ",";
+  json += "\"agAntennas\":" + String(agAntennas) + ",";
+  json += "\"agMode\":\"" + String(agModeStr) + "\",";
+  json += "\"agUptime\":" + String(agUptime) + ",";
   json += "\"agStatus\":\"" + String(agStatusStr) + "\",";
   json += "\"portA\":\"" + antA + "\",";
   json += "\"portB\":\"" + antB + "\",";
@@ -390,7 +402,7 @@ void discoverAntennaGenius() {
 
   webLog("[DISC] Broadcast: %s", buf);
 
-  // IP parsen
+  // ip=
   char *ipStr = strstr(buf, "ip=");
   if (ipStr) {
     uint8_t a, b, c, d;
@@ -403,20 +415,42 @@ void discoverAntennaGenius() {
   }
   snprintf(agIPStr, sizeof(agIPStr), "%s", agIP.toString().c_str());
 
-  // name=
-  char *np = strstr(buf, "name=");
-  if (np) { char tmp[48]={0}; sscanf(np+5, "%47s", tmp); snprintf(agNameStr, sizeof(agNameStr), "%s", tmp); }
+  // port=
+  char *pp = strstr(buf, " port=");
+  if (pp) sscanf(pp + 6, "%hu", &agTcpPort);
+
+  // v= (Firmware — im Broadcast-Paket, wird ggf. durch Prologue überschrieben)
+  char *vp = strstr(buf, " v=");
+  if (vp) { char tmp[16]={0}; sscanf(vp + 3, "%15s", tmp); snprintf(agFwStr,  sizeof(agFwStr),  "%s", tmp); }
 
   // serial=
   char *sp = strstr(buf, "serial=");
-  if (sp) { char tmp[24]={0}; sscanf(sp+7, "%23s", tmp); snprintf(agSerialStr, sizeof(agSerialStr), "%s", tmp); }
+  if (sp) { char tmp[24]={0}; sscanf(sp + 7, "%23s", tmp); snprintf(agSerialStr, sizeof(agSerialStr), "%s", tmp); }
 
-  // v= (Firmware)
-  char *vp = strstr(buf, " v=");
-  if (vp) { char tmp[16]={0}; sscanf(vp+3, "%15s", tmp); snprintf(agFwStr, sizeof(agFwStr), "%s", tmp); }
+  // name=
+  char *np = strstr(buf, "name=");
+  if (np) { char tmp[48]={0}; sscanf(np + 5, "%47s", tmp); snprintf(agNameStr, sizeof(agNameStr), "%s", tmp); }
+
+  // ports=
+  char *prp = strstr(buf, "ports=");
+  if (prp) sscanf(prp + 6, "%hhu", &agPorts);
+
+  // antennas=
+  char *anp = strstr(buf, "antennas=");
+  if (anp) sscanf(anp + 9, "%hhu", &agAntennas);
+
+  // mode=
+  char *mp = strstr(buf, "mode=");
+  if (mp) { char tmp[12]={0}; sscanf(mp + 5, "%11s", tmp); snprintf(agModeStr, sizeof(agModeStr), "%s", tmp); }
+
+  // uptime=
+  char *up = strstr(buf, "uptime=");
+  if (up) sscanf(up + 7, "%lu", &agUptime);
 
   webLog("[DISC] AG gefunden: %s  Name: %s  S/N: %s  FW: %s",
          agIPStr, agNameStr, agSerialStr, agFwStr);
+  webLog("[DISC] Port: %d  Radio-Ports: %d  Antennen: %d  Mode: %s  Uptime: %lus",
+         agTcpPort, agPorts, agAntennas, agModeStr, agUptime);
   agFound = true;
   udp.stop();
   ssePushStatus();
@@ -470,16 +504,57 @@ void handleAGReceive() {
     return;
   }
 
+  // Timeout-Prüfung: Config-Schritt hängt zu lange?
+  if (agCfgState != AGCFG_IDLE && agCfgState != AGCFG_DONE &&
+      agCfgTimeout > 0 && millis() > agCfgTimeout) {
+    webLog("[AG] TIMEOUT in Config-Schritt %d – ueberspringe", (int)agCfgState);
+    agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
+    // Schritt überspringen und mit nächstem fortfahren
+    switch (agCfgState) {
+      case AGCFG_WAIT_SUB_PORT:
+        webLog("[AG] Ueberspringe sub port – starte band list");
+        agCfgState   = AGCFG_WAIT_BAND_LIST;
+        agCfgSeq     = agSeq;
+        sendAGCommand("band list");
+        break;
+      case AGCFG_WAIT_BAND_LIST:
+        webLog("[AG] Ueberspringe band list – starte antenna list");
+        agCfgState   = AGCFG_WAIT_ANTENNA_LIST;
+        agCfgSeq     = agSeq;
+        sendAGCommand("antenna list");
+        break;
+      case AGCFG_WAIT_ANTENNA_LIST:
+        webLog("[AG] Ueberspringe antenna list – starte port get 1");
+        agCfgState   = AGCFG_WAIT_PORT1;
+        agCfgSeq     = agSeq;
+        sendAGCommand("port get 1");
+        break;
+      case AGCFG_WAIT_PORT1:
+        webLog("[AG] Ueberspringe port get 1 – starte port get 2");
+        agCfgState   = AGCFG_WAIT_PORT2;
+        agCfgSeq     = agSeq;
+        sendAGCommand("port get 2");
+        break;
+      case AGCFG_WAIT_PORT2:
+        webLog("[AG] Ueberspringe port get 2 – Config abgeschlossen");
+        agCfgState   = AGCFG_DONE;
+        agConfigDone = true;
+        snprintf(agStatusStr, sizeof(agStatusStr), "OK (unvollst.)");
+        ssePushStatus();
+        break;
+      default:
+        agCfgState = AGCFG_DONE;
+        break;
+    }
+  }
+
   while (agClient.available()) {
     char c = agClient.read();
     if (c == '\r') continue;
     if (c != '\n') { agLineBuf += c; continue; }
-
-    // Vollständige Zeile empfangen
     String line = agLineBuf;
     agLineBuf = "";
     if (line.length() == 0) continue;
-
     agProcessLine(line);
   }
 }
@@ -515,13 +590,13 @@ void agProcessLine(const String &line) {
 }
 
 // ─── Konfigurationssequenz starten ────────────────────────────────────────
-// Reihenfolge laut Protokoll:
-//  1. sub port    → Port-Statusänderungen abonnieren
-//  2. sub antenna → Antennen-Statusänderungen abonnieren
-//  3. band list   → Bänder einlesen
-//  4. antenna list→ Antennen einlesen
-//  5. port get 1  → initialer Port-A-Status
-//  6. port get 2  → initialer Port-B-Status
+// Reihenfolge laut Protokoll-Doku:
+//  1. sub port all → Port-Statusänderungen abonnieren (Parameter "all" Pflicht!)
+//     sub antenna existiert NICHT – nur: antenna, group, output, port, relay
+//  2. band list    → Bänder einlesen
+//  3. antenna list → Antennen einlesen
+//  4. port get 1   → initialer Port-A-Status
+//  5. port get 2   → initialer Port-B-Status
 
 void agStartConfig() {
   webLog("[AG] Starte Konfigurationssequenz...");
@@ -533,7 +608,8 @@ void agStartConfig() {
   agRespLines  = "";
   agCfgState   = AGCFG_WAIT_SUB_PORT;
   agCfgSeq     = agSeq;
-  sendAGCommand("sub port");
+  agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
+  sendAGCommand("sub port all");   // "all" ist Pflichtparameter laut API-Doku!
 }
 
 // ─── Config-Antworten verarbeiten (nicht-blockierend) ─────────────────────
@@ -542,66 +618,59 @@ void agStartConfig() {
 // mehrere R<seq>|0|<daten> Zeilen und enden mit R<seq>|0| (leer).
 
 void agHandleConfigResponse(const String &line) {
-  // Sequenznummer extrahieren
   int p1 = line.indexOf('|');
   if (p1 < 0) return;
   uint8_t seq = (uint8_t)line.substring(1, p1).toInt();
 
-  // Hex-Response-Code
   int p2 = line.indexOf('|', p1 + 1);
   if (p2 < 0) return;
   String hexResp = line.substring(p1 + 1, p2);
   hexResp.trim();
   String message = line.substring(p2 + 1);
 
-  // Fehler-Response?
-  if (hexResp != "0" && hexResp != "00000000") {
-    webLog("[AG] Fehler-Response seq=%d code=%s msg='%s'",
+  bool isError = (hexResp != "0" && hexResp != "00000000");
+  if (isError) {
+    webLog("[AG] Fehler seq=%d code=%s msg='%s'",
            seq, hexResp.c_str(), message.c_str());
-    // Trotzdem weitermachen
   }
 
-  // Nur Antworten zur laufenden Config-Sequenz verarbeiten
-  if (seq != agCfgSeq && agCfgState != AGCFG_DONE) {
-    // Könnte Antwort auf ping oder port set sein — ignorieren für Config
-    // Aber port-get-Antworten außerhalb der Config verarbeiten
+  // Antworten ausserhalb der Config-Sequenz
+  if (seq != agCfgSeq || agCfgState == AGCFG_DONE) {
     if (message.startsWith("port ")) parsePortLine(message);
     return;
   }
 
+  // Timeout zurücksetzen da eine Antwort kam
+  agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
+
   switch (agCfgState) {
 
     case AGCFG_WAIT_SUB_PORT:
-      // R<seq>|0| → sub port OK
-      webLog("[AG] sub port OK");
-      agCfgState = AGCFG_WAIT_SUB_ANTENNA;
-      agCfgSeq   = agSeq;
-      sendAGCommand("sub antenna");
-      break;
-
-    case AGCFG_WAIT_SUB_ANTENNA:
-      webLog("[AG] sub antenna OK");
+      // Bei Fehler trotzdem weitermachen (z.B. schon abonniert)
+      if (isError)
+        webLog("[AG] sub port Warnung – fahre fort");
+      else
+        webLog("[AG] sub port all OK");
       agCfgState = AGCFG_WAIT_BAND_LIST;
       agCfgSeq   = agSeq;
-      agRespLines = "";
+      agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
       sendAGCommand("band list");
       break;
 
     case AGCFG_WAIT_BAND_LIST:
       if (message.length() > 0) {
-        // Datenzeile: "band 1 name=160m freq_start=1.6 freq_stop=2.2"
         parseBandListLine(message);
       } else {
         // Leere Message = Ende des Blocks
         webLog("[AG] band list: %d Baender geladen", bandCount);
-        for (uint8_t i = 0; i < MAX_BANDS; i++) {
+        for (uint8_t i = 0; i < MAX_BANDS; i++)
           if (bands[i].valid && bands[i].freqStop > 0)
             webLog("     Band %2d: %-12s %.3f-%.3f MHz",
                    bands[i].id, bands[i].name,
                    bands[i].freqStart, bands[i].freqStop);
-        }
-        agCfgState = AGCFG_WAIT_ANTENNA_LIST;
-        agCfgSeq   = agSeq;
+        agCfgState   = AGCFG_WAIT_ANTENNA_LIST;
+        agCfgSeq     = agSeq;
+        agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
         sendAGCommand("antenna list");
       }
       break;
@@ -611,13 +680,13 @@ void agHandleConfigResponse(const String &line) {
         parseAntennaListLine(message);
       } else {
         webLog("[AG] antenna list: %d Antennen geladen", antennaCount);
-        for (uint8_t i = 0; i < MAX_ANTENNAS; i++) {
+        for (uint8_t i = 0; i < MAX_ANTENNAS; i++)
           if (antennas[i].valid)
             webLog("     Ant  %2d: %-20s TX-Mask: %04X",
                    antennas[i].id, antennas[i].name, antennas[i].txMask);
-        }
-        agCfgState = AGCFG_WAIT_PORT1;
-        agCfgSeq   = agSeq;
+        agCfgState   = AGCFG_WAIT_PORT1;
+        agCfgSeq     = agSeq;
+        agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
         sendAGCommand("port get 1");
       }
       break;
@@ -625,8 +694,9 @@ void agHandleConfigResponse(const String &line) {
     case AGCFG_WAIT_PORT1:
       if (message.startsWith("port ")) parsePortLine(message);
       if (message.length() == 0) {
-        agCfgState = AGCFG_WAIT_PORT2;
-        agCfgSeq   = agSeq;
+        agCfgState   = AGCFG_WAIT_PORT2;
+        agCfgSeq     = agSeq;
+        agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
         sendAGCommand("port get 2");
       }
       break;
@@ -643,7 +713,6 @@ void agHandleConfigResponse(const String &line) {
       break;
 
     default:
-      // Im laufenden Betrieb: port-Antworten verarbeiten
       if (message.startsWith("port ")) parsePortLine(message);
       break;
   }
@@ -1028,6 +1097,11 @@ void handleApiJson() {
   json += "\"agSerial\":\"" + String(agSerialStr) + "\",";
   json += "\"agFw\":\"" + String(agFwStr) + "\",";
   json += "\"agIP\":\"" + String(agIPStr) + "\",";
+  json += "\"agPort\":" + String(agTcpPort) + ",";
+  json += "\"agPorts\":" + String(agPorts) + ",";
+  json += "\"agAntennas\":" + String(agAntennas) + ",";
+  json += "\"agMode\":\"" + String(agModeStr) + "\",";
+  json += "\"agUptime\":" + String(agUptime) + ",";
   json += "\"agStatus\":\"" + String(agStatusStr) + "\",";
   json += "\"portA\":\"" + antA + "\",";
   json += "\"portB\":\"" + antB + "\",";
@@ -1122,8 +1196,13 @@ void handleWebRoot() {
     <h2>Antenna Genius</h2>
     <div class="kv"><span class="label">Name</span><span class="val" id="agName">---</span></div>
     <div class="kv"><span class="label">IP-Adresse</span><span class="val" id="agIP">---</span></div>
+    <div class="kv"><span class="label">TCP-Port</span><span class="val" id="agPort">---</span></div>
     <div class="kv"><span class="label">Seriennummer</span><span class="val" id="agSerial">---</span></div>
     <div class="kv"><span class="label">Firmware</span><span class="val" id="agFw">---</span></div>
+    <div class="kv"><span class="label">Radio-Ports</span><span class="val" id="agPorts">---</span></div>
+    <div class="kv"><span class="label">Antennen-Ports</span><span class="val" id="agAntennas">---</span></div>
+    <div class="kv"><span class="label">Stack-Mode</span><span id="agModeWrap"><span class="val" id="agMode">---</span></span></div>
+    <div class="kv"><span class="label">Uptime</span><span class="val" id="agUptime">---</span></div>
     <div class="kv"><span class="label">Status</span><span id="agStatusWrap"><span class="dot dot-muted"></span><span id="agStatus">---</span></span></div>
   </div>
   <div class="card">
@@ -1177,6 +1256,15 @@ function badgeBand(v,active){
   if(v==='---')return`<span class="badge badge-muted">---</span>`;
   return`<span class="badge ${active?'badge-green':'badge-blue'}">${esc(v)}</span>`;
 }
+function fmtUptime(s){
+  if(!s||s===0)return'---';
+  const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),
+        m=Math.floor((s%3600)/60),sec=s%60;
+  if(d>0)return`${d}d ${h}h ${m}m`;
+  if(h>0)return`${h}h ${m}m ${sec}s`;
+  if(m>0)return`${m}m ${sec}s`;
+  return`${sec}s`;
+}
 function applyStatus(d){
   activeBandName=d.activeBand;
   document.getElementById('civAddr').textContent=d.civAddr;
@@ -1185,26 +1273,35 @@ function applyStatus(d){
   ab.innerHTML=d.activeBand!=='---'?`<span class="badge badge-blue">${esc(d.activeBand)}</span>`:`<span class="badge badge-muted">---</span>`;
   document.getElementById('agName').textContent=d.agName;
   document.getElementById('agIP').textContent=d.agIP;
+  if(document.getElementById('agPort'))
+    document.getElementById('agPort').textContent=d.agPort>0?':'+d.agPort:'---';
   document.getElementById('agSerial').textContent=d.agSerial||'---';
   document.getElementById('agFw').textContent=d.agFw||'---';
+  if(document.getElementById('agPorts'))
+    document.getElementById('agPorts').textContent=d.agPorts>0?d.agPorts:'---';
+  if(document.getElementById('agAntennas'))
+    document.getElementById('agAntennas').textContent=d.agAntennas>0?d.agAntennas:'---';
+  if(document.getElementById('agMode')){
+    const mode=d.agMode||'---';
+    const mw=document.getElementById('agModeWrap');
+    if(mode==='master')mw.innerHTML=`<span class="badge badge-green">master</span>`;
+    else if(mode==='slave')mw.innerHTML=`<span class="badge badge-blue">slave</span>`;
+    else mw.innerHTML=`<span class="val">${esc(mode)}</span>`;
+  }
+  if(document.getElementById('agUptime'))
+    document.getElementById('agUptime').textContent=fmtUptime(d.agUptime);
   const sw=document.getElementById('agStatusWrap');
   sw.innerHTML=`<span class="dot ${dotClass(d.agStatus)}"></span><span>${esc(d.agStatus)}</span>`;
   document.getElementById('portA').innerHTML=badgeAnt(d.portA);
   document.getElementById('portB').innerHTML=badgeAnt(d.portB);
-  document.getElementById('bandA').innerHTML=badgeBand(d.bandA||'---', d.bandA===d.activeBand);
-  document.getElementById('bandB').innerHTML=badgeBand(d.bandB||'---', d.bandB===d.activeBand);
+  document.getElementById('bandA').innerHTML=badgeBand(d.bandA||'---',d.bandA===d.activeBand);
+  document.getElementById('bandB').innerHTML=badgeBand(d.bandB||'---',d.bandB===d.activeBand);
   document.getElementById('txA').innerHTML=d.txA?`<span class="badge badge-tx">&#128308; SENDEN</span>`:`<span class="badge badge-muted">RX</span>`;
   document.getElementById('txB').innerHTML=d.txB?`<span class="badge badge-tx">&#128308; SENDEN</span>`:`<span class="badge badge-muted">RX</span>`;
   const cb=document.getElementById('conflictBadge');
   const banner=document.getElementById('conflict-banner');
-  if(d.conflict){
-    cb.innerHTML=`<span class="badge badge-red">&#9888; KONFLIKT</span>`;
-    banner.style.display='block';
-  }else{
-    cb.innerHTML=`<span class="badge badge-green">OK</span>`;
-    banner.style.display='none';
-  }
-  // Band-Tabelle Highlighting
+  if(d.conflict){cb.innerHTML=`<span class="badge badge-red">&#9888; KONFLIKT</span>`;banner.style.display='block';}
+  else{cb.innerHTML=`<span class="badge badge-green">OK</span>`;banner.style.display='none';}
   document.querySelectorAll('#bandTable tr').forEach(tr=>{
     if(!tr.cells[1])return;
     const active=tr.cells[1].textContent===activeBandName;
