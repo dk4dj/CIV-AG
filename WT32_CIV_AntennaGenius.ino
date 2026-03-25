@@ -55,8 +55,8 @@
 // ─── Antenna Genius ─────────────────────────────────────────────────────────
 #define AG_PORT         9007
 #define AG_KEEPALIVE_MS 5000
-#define AG_RECONNECT_MS 5000
-#define AG_CFG_TIMEOUT_MS 5000  // max. Wartezeit pro Config-Schritt
+#define AG_RECONNECT_MS 15000
+#define AG_CFG_TIMEOUT_MS 8000  // max. Wartezeit pro Config-Schritt
 #define MAX_BANDS       16
 #define MAX_ANTENNAS    16
 #define AG_RADIO_PORT   1       // Radio-Port A = 1
@@ -66,7 +66,7 @@
 
 // ─── Web-Server ──────────────────────────────────────────────────────────────
 #define WEB_PORT        80
-#define LOG_BUF_LINES   100
+#define LOG_BUF_LINES   150      // Ringpuffer für Web-Log
 
 // ─── CI-V Konstanten ────────────────────────────────────────────────────────
 #define CIV_PREAMBLE    0xFE
@@ -100,8 +100,6 @@ enum AgConfigState {
   AGCFG_WAIT_SUB_PORT,      // warte auf Antwort von "sub port all"
   AGCFG_WAIT_BAND_LIST,     // warte auf Antwort von "band list"
   AGCFG_WAIT_ANTENNA_LIST,  // warte auf Antwort von "antenna list"
-  AGCFG_WAIT_PORT1,         // warte auf Antwort von "port get 1"
-  AGCFG_WAIT_PORT2,         // warte auf Antwort von "port get 2"
   AGCFG_DONE
 };
 
@@ -129,7 +127,7 @@ uint8_t      antennaCount = 0;
 // AG nicht-blockierender Config-State
 static AgConfigState agCfgState   = AGCFG_IDLE;
 static uint8_t       agCfgSeq     = 0;
-static uint32_t      agCfgTimeout = 0;  // Timeout-Zeitstempel pro Config-Schritt
+static uint32_t      agCfgTimeout = 0;  // 0 = inaktiv; >0 = Ablaufzeitpunkt in ms
 
 // Sequenznummer für AG-Kommandos (1–255)
 static uint8_t  agSeq    = 1;
@@ -464,17 +462,28 @@ void connectToAG() {
   if (millis() - agLastConnect < AG_RECONNECT_MS) return;
   agLastConnect = millis();
 
+  static uint8_t failCount = 0;
+
   webLog("[AG] Verbinde mit %s:%d ...", agIPStr, AG_PORT);
   snprintf(agStatusStr, sizeof(agStatusStr), "Verbinde...");
 
   if (!agClient.connect(agIP, AG_PORT)) {
-    webLog("[AG] Verbindung fehlgeschlagen");
+    failCount++;
+    webLog("[AG] Verbindung fehlgeschlagen (Versuch %d)", failCount);
     snprintf(agStatusStr, sizeof(agStatusStr), "Fehler");
+    // Nach 5 fehlgeschlagenen Versuchen AG neu suchen
+    if (failCount >= 5) {
+      webLog("[AG] Zu viele Fehler – suche AG neu via Broadcast");
+      failCount  = 0;
+      agFound    = false;
+      agConnected = false;
+    }
     return;
   }
 
+  failCount = 0;
   agClient.setNoDelay(true);
-  agConnected  = false;   // erst nach Prologue true setzen
+  agConnected  = false;
   agConfigDone = false;
   agCfgState   = AGCFG_IDLE;
   agLineBuf    = "";
@@ -484,7 +493,6 @@ void connectToAG() {
 
   webLog("[AG] TCP verbunden, warte auf Prologue...");
   snprintf(agStatusStr, sizeof(agStatusStr), "Prologue...");
-  // Prologue wird nicht-blockierend in handleAGReceive() gelesen
   agConnected = true;
 }
 
@@ -504,39 +512,46 @@ void handleAGReceive() {
     return;
   }
 
-  // Timeout-Prüfung: Config-Schritt hängt zu lange?
-  if (agCfgState != AGCFG_IDLE && agCfgState != AGCFG_DONE &&
+  // Daten lesen – solange etwas verfügbar ist
+  bool gotData = false;
+  while (agClient.available()) {
+    gotData = true;
+    char c = agClient.read();
+    if (c == '\r') continue;
+    if (c != '\n') { agLineBuf += c; continue; }
+    String line = agLineBuf;
+    agLineBuf = "";
+    if (line.length() == 0) continue;
+    agProcessLine(line);
+  }
+
+  // Timeout nur prüfen wenn KEINE Daten kamen und wir auf eine Antwort warten.
+  // Timeout-Uhr läuft erst ab dem Moment wo das Kommando gesendet wurde
+  // (wird in agStartConfig/agHandleConfigResponse gesetzt).
+  if (!gotData &&
+      agCfgState != AGCFG_IDLE && agCfgState != AGCFG_DONE &&
       agCfgTimeout > 0 && millis() > agCfgTimeout) {
-    webLog("[AG] TIMEOUT in Config-Schritt %d – ueberspringe", (int)agCfgState);
-    agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
-    // Schritt überspringen und mit nächstem fortfahren
+
+    webLog("[AG] TIMEOUT Config-Schritt %d – ueberspringe", (int)agCfgState);
+    agCfgTimeout = 0;  // Einmalig auslösen, nicht wiederholen
+
     switch (agCfgState) {
       case AGCFG_WAIT_SUB_PORT:
         webLog("[AG] Ueberspringe sub port – starte band list");
         agCfgState   = AGCFG_WAIT_BAND_LIST;
-        agCfgSeq     = agSeq;
         sendAGCommand("band list");
+        agCfgSeq     = agSeq - 1;
+        agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
         break;
       case AGCFG_WAIT_BAND_LIST:
         webLog("[AG] Ueberspringe band list – starte antenna list");
         agCfgState   = AGCFG_WAIT_ANTENNA_LIST;
-        agCfgSeq     = agSeq;
         sendAGCommand("antenna list");
+        agCfgSeq     = agSeq - 1;
+        agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
         break;
       case AGCFG_WAIT_ANTENNA_LIST:
-        webLog("[AG] Ueberspringe antenna list – starte port get 1");
-        agCfgState   = AGCFG_WAIT_PORT1;
-        agCfgSeq     = agSeq;
-        sendAGCommand("port get 1");
-        break;
-      case AGCFG_WAIT_PORT1:
-        webLog("[AG] Ueberspringe port get 1 – starte port get 2");
-        agCfgState   = AGCFG_WAIT_PORT2;
-        agCfgSeq     = agSeq;
-        sendAGCommand("port get 2");
-        break;
-      case AGCFG_WAIT_PORT2:
-        webLog("[AG] Ueberspringe port get 2 – Config abgeschlossen");
+        webLog("[AG] Ueberspringe antenna list – Config abgeschlossen");
         agCfgState   = AGCFG_DONE;
         agConfigDone = true;
         snprintf(agStatusStr, sizeof(agStatusStr), "OK (unvollst.)");
@@ -546,16 +561,6 @@ void handleAGReceive() {
         agCfgState = AGCFG_DONE;
         break;
     }
-  }
-
-  while (agClient.available()) {
-    char c = agClient.read();
-    if (c == '\r') continue;
-    if (c != '\n') { agLineBuf += c; continue; }
-    String line = agLineBuf;
-    agLineBuf = "";
-    if (line.length() == 0) continue;
-    agProcessLine(line);
   }
 }
 
@@ -568,7 +573,8 @@ void agProcessLine(const String &line) {
     sscanf(line.c_str() + 1, "%15s", fw);
     snprintf(agFwStr, sizeof(agFwStr), "%s", fw);
     webLog("[AG] Prologue: %s", line.c_str());
-    // Jetzt Konfiguration starten
+    // Kurze Pause damit AG bereit ist Kommandos zu empfangen
+    delay(200);
     agStartConfig();
     return;
   }
@@ -607,9 +613,9 @@ void agStartConfig() {
   memset(antennas, 0, sizeof(antennas));
   agRespLines  = "";
   agCfgState   = AGCFG_WAIT_SUB_PORT;
-  agCfgSeq     = agSeq;
+  sendAGCommand("sub port all");
+  agCfgSeq     = agSeq - 1;  // agSeq wurde in sendAGCommand bereits inkrementiert
   agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
-  sendAGCommand("sub port all");   // "all" ist Pflichtparameter laut API-Doku!
 }
 
 // ─── Config-Antworten verarbeiten (nicht-blockierend) ─────────────────────
@@ -646,15 +652,14 @@ void agHandleConfigResponse(const String &line) {
   switch (agCfgState) {
 
     case AGCFG_WAIT_SUB_PORT:
-      // Bei Fehler trotzdem weitermachen (z.B. schon abonniert)
       if (isError)
         webLog("[AG] sub port Warnung – fahre fort");
       else
         webLog("[AG] sub port all OK");
       agCfgState = AGCFG_WAIT_BAND_LIST;
-      agCfgSeq   = agSeq;
-      agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
       sendAGCommand("band list");
+      agCfgSeq     = agSeq - 1;
+      agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
       break;
 
     case AGCFG_WAIT_BAND_LIST:
@@ -669,9 +674,9 @@ void agHandleConfigResponse(const String &line) {
                    bands[i].id, bands[i].name,
                    bands[i].freqStart, bands[i].freqStop);
         agCfgState   = AGCFG_WAIT_ANTENNA_LIST;
-        agCfgSeq     = agSeq;
-        agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
         sendAGCommand("antenna list");
+        agCfgSeq     = agSeq - 1;
+        agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
       }
       break;
 
@@ -684,26 +689,9 @@ void agHandleConfigResponse(const String &line) {
           if (antennas[i].valid)
             webLog("     Ant  %2d: %-20s TX-Mask: %04X",
                    antennas[i].id, antennas[i].name, antennas[i].txMask);
-        agCfgState   = AGCFG_WAIT_PORT1;
-        agCfgSeq     = agSeq;
-        agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
-        sendAGCommand("port get 1");
-      }
-      break;
-
-    case AGCFG_WAIT_PORT1:
-      if (message.startsWith("port ")) parsePortLine(message);
-      if (message.length() == 0) {
-        agCfgState   = AGCFG_WAIT_PORT2;
-        agCfgSeq     = agSeq;
-        agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
-        sendAGCommand("port get 2");
-      }
-      break;
-
-    case AGCFG_WAIT_PORT2:
-      if (message.startsWith("port ")) parsePortLine(message);
-      if (message.length() == 0) {
+        // Port-Status wurde bereits via S0|port nach sub port all empfangen.
+        // Zusaetzliche port get Abfragen werden im laufenden Betrieb durch
+        // pollPortStatus() alle PORT_POLL_MS Millisekunden erledigt.
         agCfgState   = AGCFG_DONE;
         agConfigDone = true;
         snprintf(agStatusStr, sizeof(agStatusStr), "OK");
@@ -739,10 +727,9 @@ void agHandleStatusMessage(const String &line) {
 
   if (msg == "antenna reload") {
     webLog("[AG] Antennen-Konfiguration geaendert, lade neu...");
-    // Antennen neu einlesen
     agCfgState = AGCFG_WAIT_ANTENNA_LIST;
-    agCfgSeq   = agSeq;
     sendAGCommand("antenna list");
+    agCfgSeq   = agSeq - 1;
     return;
   }
 
@@ -755,8 +742,11 @@ void agHandleStatusMessage(const String &line) {
 void sendAGCommand(const char *cmd) {
   if (!agClient.connected()) return;
   char buf[128];
-  snprintf(buf, sizeof(buf), "C%d|%s\r", agSeq, cmd);
-  agClient.print(buf);
+  // Protokoll-Doku: Terminator = 0x0D (\r)
+  // Einige AG-Firmwareversionen erwarten \r\n — wir senden beides zur Sicherheit
+  snprintf(buf, sizeof(buf), "C%d|%s\r\n", agSeq, cmd);
+  agClient.write((const uint8_t*)buf, strlen(buf));
+  agClient.flush();
   webLog("[AG] >> C%d|%s", agSeq, cmd);
   agSeq++;
   if (agSeq > 255) agSeq = 1;
