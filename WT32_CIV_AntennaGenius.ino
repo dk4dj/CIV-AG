@@ -8,24 +8,32 @@
  * Ethernet : DHCP, Discovery via UDP Broadcast Port 9007
  * AG API   : TCP Port 9007 (ASCII-Protokoll)
  *
+ * Display  : EA DOGL128W-6 (ST7565, 128x64, Software-SPI)
+ *            Bibliothek: U8g2 (Arduino Library Manager)
+ *            MOSI=GPIO15  SCK=GPIO14  CS=GPIO12
+ *            A0  =GPIO2   RST=GPIO33
+ *
+ * Encoder  : Drehencoder mit Taster
+ *            ENC_A=GPIO39  ENC_B=GPIO36  BTN=GPIO35
+ *            Alle drei input-only → externe 10 kΩ Pull-ups an 3.3 V erforderlich!
+ *
  * Ablauf:
  *  1. Ethernet per DHCP initialisieren
  *  2. UDP-Broadcast auf Port 9007 lauschen → Antenna Genius finden
  *  3. TCP-Verbindung zum AG aufbauen, Prologue lesen
- *  4. sub port + sub antenna → Status-Nachrichten aktivieren
+ *  4. sub port all → Port-Statusänderungen abonnieren
  *  5. band list + antenna list → Konfiguration einlesen
- *  6. port get 1 + port get 2 → initialen Port-Status abfragen
- *  7. CI-V-Frequenz empfangen (Broadcast) oder aktiv pollen (Cmd 0x03)
- *     → Band bestimmen → port set senden
+ *  6. CI-V-Frequenz empfangen oder aktiv pollen → Band → port set
  *
  * AG-Protokoll-Hinweise:
  *  - Antwortblock endet mit einer Zeile "R<seq>|0|" (leere Message)
- *  - Ohne "sub port" / "sub antenna" sendet AG KEINE Status-Nachrichten
+ *  - Ohne "sub port all" sendet AG KEINE Status-Nachrichten
  *  - Status-Format: S0|<message>
  *  - Frequenzformat im CI-V: 5 BCD-Bytes, little-endian (1 Hz Auflösung)
  *
  * Bibliotheken (Board: esp32 by Espressif ≥ 2.x):
  *  - ETH.h, WiFiUdp.h, WiFiClient.h, WebServer.h (alle im ESP32-Core)
+ *  - U8g2lib.h  (U8g2 by olikraus, Arduino Library Manager)
  *
  * Board-Einstellungen in der Arduino IDE:
  *  Board      : "ESP32 Dev Module"
@@ -36,6 +44,16 @@
 #include <WiFiUdp.h>
 #include <WiFiClient.h>
 #include <WebServer.h>
+
+// ─── Display & Encoder aktivieren ───────────────────────────────────────────
+// Auf 0 setzen um Display und Encoder vollständig zu deaktivieren
+// (kein #include, keine Pin-Belegung, kein Code-Overhead)
+#define DISPLAY_ENABLED  1
+
+#if DISPLAY_ENABLED
+#include <U8g2lib.h>
+#include <SPI.h>
+#endif
 
 // ─── WT32-ETH01 Ethernet-Pins ───────────────────────────────────────────────
 #define ETH_CLK_MODE    ETH_CLOCK_GPIO0_IN
@@ -63,6 +81,27 @@
 
 // ─── Konflikt-Ausgang ────────────────────────────────────────────────────────
 #define CONFLICT_PIN    4
+
+// ─── Display (EA DOGL128W-6, ST7565, Software-SPI) ──────────────────────────
+// Alle Pins sind am WT32-ETH01 frei verfügbar.
+// GPIO2  : Vorsicht beim Flashen (Strapping-Pin) – nach dem Flash normal nutzbar.
+// GPIO35/36: Input-Only – daher ideal für Encoder-Eingänge (kein Output nötig).
+#define DISP_MOSI_PIN   15   // SI  des DOGL128
+#define DISP_SCK_PIN    14   // SCL des DOGL128
+#define DISP_CS_PIN     12   // CSB des DOGL128 (active low)
+#define DISP_A0_PIN      2   // A0  des DOGL128 (RS: 0=Cmd, 1=Data)
+#define DISP_RST_PIN    33   // RST des DOGL128 (active low)
+
+// ─── Drehencoder ─────────────────────────────────────────────────────────────
+#define ENC_A_PIN       39   // Encoder Kanal A  (input-only, ext. Pull-up, ISR)
+#define ENC_B_PIN       36   // Encoder Kanal B  (input-only, ext. Pull-up)
+#define ENC_BTN_PIN     35   // Encoder Taster   (input-only, ext. Pull-up)
+// Hinweis: GPIO35/36/39 sind input-only ohne internen Pull-up.
+// Externe Pull-up-Widerstände (10 kΩ) an 3.3 V sind zwingend erforderlich!
+// GPIO36/39 haben 270 pF interne Kapazität → Encoder-B wird per Polling gelesen
+// (kein ISR auf GPIO36) um möglichen Crosstalk zu vermeiden.
+#define ENC_DEBOUNCE_MS  5   // Entprellzeit Taster in ms
+#define MENU_TIMEOUT_MS 10000 // Menü schließt sich nach 10 s Inaktivität
 
 // ─── Web-Server ──────────────────────────────────────────────────────────────
 #define WEB_PORT        80
@@ -180,10 +219,61 @@ static uint8_t  agAntennas   = 0;    // Anzahl Antennen-Ports
 static char     agModeStr[12]= "---";
 static uint32_t agUptime     = 0;    // Sekunden seit letztem Boot
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Forward Declarations
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── Display & Encoder ───────────────────────────────────────────────────────
+#if DISPLAY_ENABLED
 
+// U8g2: Software-SPI, Single-Page-Rendering (128 Byte RAM statt 1 KB)
+// Rotation U8G2_R2 = 180° (je nach Einbaulage anpassen: R0/R1/R2/R3)
+U8G2_ST7565_EA_DOGM128_1_4W_SW_SPI u8g2(
+  U8G2_R2,
+  DISP_SCK_PIN, DISP_MOSI_PIN,
+  DISP_CS_PIN,  DISP_A0_PIN,
+  DISP_RST_PIN
+);
+
+// Display-Kontrast 0–63 (typisch 20–30 für DOGL128 mit 3.3 V)
+#define DISP_CONTRAST   22
+
+// Menü-Zustände
+enum MenuState {
+  MENU_STATUS,      // Normalanzeige: Frequenz / Band / Antenne
+  MENU_ANT_SELECT,  // Antennen-Auswahl für aktuelles Band
+  MENU_CONFIRM      // Bestätigungsdialog
+};
+
+static MenuState    menuState      = MENU_STATUS;
+static uint8_t      menuCursor     = 0;  // ausgewähltes Element
+static uint8_t      menuAntCount   = 0;  // Antennen für aktuelles Band
+static uint8_t      menuAntIds[MAX_ANTENNAS]; // IDs der wählbaren Antennen
+static uint32_t     menuLastAction = 0;  // letzter Encoder-/Tasterdruck (ms)
+static bool         dispNeedsRedraw = true;
+
+// Encoder-State (ISR-sicher)
+static volatile int8_t  encDelta   = 0;  // akkumulierte Schritte seit letztem Loop
+static volatile bool    encBtnPressed = false;
+static uint32_t         encBtnTime = 0;
+
+// ISR für Encoder Kanal A (im Loop ausgewertet wegen SPI-Konflikte)
+// Einfaches Gray-Code-Decoding
+static void IRAM_ATTR encISR() {
+  static uint8_t last = 0;
+  uint8_t a = digitalRead(ENC_A_PIN);
+  uint8_t b = digitalRead(ENC_B_PIN);
+  uint8_t cur = (a << 1) | b;
+  // Gray-Code Tabelle: +1 oder -1 je nach Übergang
+  static const int8_t table[16] = {
+     0, -1,  1,  0,
+     1,  0,  0, -1,
+    -1,  0,  0,  1,
+     0,  1, -1,  0
+  };
+  encDelta += table[(last << 2) | cur];
+  last = cur;
+}
+
+#endif // DISPLAY_ENABLED
+
+// ─── Forward Declarations ────────────────────────────────────────────────────
 void webLog(const char *fmt, ...);
 void ssePushStatus();
 void handleWebRoot();
@@ -211,6 +301,16 @@ void checkAndSignalConflict(uint8_t wantedAntId);
 void parseBandListLine(const String &line);
 void parseAntennaListLine(const String &line);
 void parsePortLine(const String &line);
+#if DISPLAY_ENABLED
+void displaySetup();
+void displayLoop();
+void displayDrawStatus();
+void displayDrawAntMenu();
+void displayDrawConfirm();
+void menuBuildAntList();
+void menuHandleEncoder();
+void menuSelectAntenna(uint8_t antId);
+#endif
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Logging
@@ -348,6 +448,10 @@ void setup() {
   digitalWrite(CONFLICT_PIN, LOW);
   webLog("[CONF] Konflikt-Ausgang: GPIO%d", CONFLICT_PIN);
 
+#if DISPLAY_ENABLED
+  displaySetup();
+#endif
+
   webServer.on("/",       HTTP_GET, handleWebRoot);
   webServer.on("/api",    HTTP_GET, handleApiJson);
   webServer.on("/events", HTTP_GET, handleSSE);
@@ -370,11 +474,20 @@ void loop() {
 
   handleAGReceive();   // nicht-blockierend AG-Daten lesen & verarbeiten
 
+#if DISPLAY_ENABLED
+  // Encoder auch während Config-Phase auswerten (Menü immer bedienbar)
+  menuHandleEncoder();
+#endif
+
   if (!agConfigDone) return;
 
   handleCIV();
   sendKeepalive();
   pollPortStatus();
+
+#if DISPLAY_ENABLED
+  displayLoop();
+#endif
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1332,3 +1445,402 @@ setInterval(loadConfig,30000);
   webServer.sendHeader("Cache-Control","no-cache");
   webServer.send(200,"text/html; charset=utf-8",html);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Display & Encoder (nur aktiv wenn DISPLAY_ENABLED = 1)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#if DISPLAY_ENABLED
+
+// ─── Hilfsfunktionen ──────────────────────────────────────────────────────
+
+// Gibt die Antennen-ID zurück die aktuell auf dem betrachteten Radio-Port liegt
+static uint8_t currentAntId() {
+  return portTxAnt[AG_RADIO_PORT - 1];
+}
+
+// Kürzt einen String auf maxLen Zeichen + '\0' und fügt '..' an wenn nötig
+static void truncStr(char *dst, const char *src, uint8_t maxLen) {
+  strncpy(dst, src, maxLen);
+  dst[maxLen] = '\0';
+  if (strlen(src) > maxLen) {
+    dst[maxLen-1] = '.';
+    dst[maxLen-2] = '.';
+  }
+}
+
+// ─── Setup ────────────────────────────────────────────────────────────────
+
+void displaySetup() {
+  // Encoder-Pins
+  // GPIO35/36/39: input-only, kein interner Pull-up → ext. 10 kΩ an 3.3 V nötig
+  pinMode(ENC_A_PIN,   INPUT);   // ext. Pull-up erforderlich
+  pinMode(ENC_B_PIN,   INPUT);   // ext. Pull-up erforderlich
+  pinMode(ENC_BTN_PIN, INPUT);   // ext. Pull-up erforderlich
+
+  // ISR auf beide Flanken von Kanal A (GPIO39)
+  // Kanal B (GPIO36) wird per Polling gelesen um 36/39-Crosstalk zu vermeiden
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), encISR, CHANGE);
+
+  // Display initialisieren
+  u8g2.begin();
+  u8g2.setContrast(DISP_CONTRAST);
+  u8g2.setFontMode(1);   // transparenter Hintergrund
+
+  // Begrüßungsbildschirm
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(2,  12, "CI-V / AG Bridge");
+    u8g2.drawStr(2,  26, "WT32-ETH01");
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(2,  40, "Suche Antenna Genius...");
+    u8g2.drawHLine(0, 46, 128);
+    u8g2.drawStr(2,  56, "github: CI-V-Bridge");
+  } while (u8g2.nextPage());
+
+  menuLastAction = millis();
+  webLog("[DISP] Display initialisiert (DOGL128W-6, ST7565)");
+}
+
+// ─── Hauptschleife Display ─────────────────────────────────────────────────
+
+void displayLoop() {
+  // Menü-Timeout → zurück zur Statusanzeige
+  if (menuState != MENU_STATUS &&
+      millis() - menuLastAction > MENU_TIMEOUT_MS) {
+    menuState     = MENU_STATUS;
+    dispNeedsRedraw = true;
+  }
+
+  if (!dispNeedsRedraw) return;
+  dispNeedsRedraw = false;
+
+  switch (menuState) {
+    case MENU_STATUS:     displayDrawStatus();   break;
+    case MENU_ANT_SELECT: displayDrawAntMenu();  break;
+    case MENU_CONFIRM:    displayDrawConfirm();  break;
+  }
+}
+
+// ─── Statusanzeige (Normalanzeige) ────────────────────────────────────────
+//
+// ┌────────────────────────────────┐
+// │ 14.225.000 MHz                 │  ← Frequenz (groß)
+// │ Band: 20m                      │
+// │ Ant:  Beam_OB11-3              │
+// │────────────────────────────────│
+// │ AG: OK  Port A  [kein Konflik] │
+// └────────────────────────────────┘
+
+void displayDrawStatus() {
+  char buf[24];
+
+  u8g2.firstPage();
+  do {
+    // ── Zeile 1: Frequenz ──
+    u8g2.setFont(u8g2_font_7x14B_tf);
+    if (civFreqMHz > 0.001) {
+      // Format: 14.225.000 MHz
+      uint32_t kHz = (uint32_t)(civFreqMHz * 1000.0 + 0.5);
+      uint16_t mhz  = kHz / 1000;
+      uint16_t frac = kHz % 1000;
+      snprintf(buf, sizeof(buf), "%u.%03u MHz", mhz, frac);
+    } else {
+      strcpy(buf, "--- MHz");
+    }
+    u8g2.drawStr(0, 13, buf);
+
+    u8g2.setFont(u8g2_font_6x10_tf);
+
+    // ── Zeile 2: Band ──
+    if (lastBandId >= 0 && lastBandId < MAX_BANDS && bands[lastBandId].valid) {
+      snprintf(buf, sizeof(buf), "Band: %s", bands[lastBandId].name);
+    } else {
+      strcpy(buf, "Band: ---");
+    }
+    u8g2.drawStr(0, 26, buf);
+
+    // ── Zeile 3: Antenne ──
+    uint8_t aid = currentAntId();
+    char antName[18] = "---";
+    if (aid > 0 && aid <= MAX_ANTENNAS && antennas[aid-1].valid)
+      truncStr(antName, antennas[aid-1].name, 17);
+    snprintf(buf, sizeof(buf), "Ant:  %s", antName);
+    u8g2.drawStr(0, 37, buf);
+
+    // ── Trennlinie ──
+    u8g2.drawHLine(0, 41, 128);
+
+    // ── Zeile 4: Status ──
+    u8g2.setFont(u8g2_font_5x7_tf);
+
+    // AG-Status links
+    snprintf(buf, sizeof(buf), "AG:%s", agStatusStr);
+    u8g2.drawStr(0, 50, buf);
+
+    // Konflikt rechts
+    if (conflictActive) {
+      u8g2.setDrawColor(1);
+      u8g2.drawBox(80, 43, 48, 9);
+      u8g2.setDrawColor(0);
+      u8g2.drawStr(82, 51, "KONFLIKT");
+      u8g2.setDrawColor(1);
+    } else {
+      u8g2.drawStr(82, 51, "kein Konfl.");
+    }
+
+    // ── Zeile 5: Hinweis auf Menü ──
+    if (agConfigDone) {
+      u8g2.drawStr(0, 62, "Drehen: Ant wahlen  [Btn]");
+    } else {
+      snprintf(buf, sizeof(buf), "IP: %s", agIPStr[0] ? agIPStr : "...");
+      u8g2.drawStr(0, 62, buf);
+    }
+
+  } while (u8g2.nextPage());
+}
+
+// ─── Antennen-Auswahlmenü ─────────────────────────────────────────────────
+//
+// ┌────────────────────────────────┐
+// │ Antenne wählen [20m]           │
+// │ > Beam_OB11-3          [aktiv] │
+// │   Dipol_160-80-40              │
+// │   GP_10m                       │
+// │────────────────────────────────│
+// │ [Btn] = Auswählen   Drehgeber  │
+// └────────────────────────────────┘
+
+// Maximale Anzahl Einträge die gleichzeitig sichtbar sind
+#define ANT_MENU_ROWS  4
+
+void displayDrawAntMenu() {
+  char buf[22];
+  uint8_t curAntId = currentAntId();
+
+  // Scroll-Offset: menuCursor immer im sichtbaren Bereich halten
+  static uint8_t scrollOffset = 0;
+  if (menuCursor < scrollOffset)
+    scrollOffset = menuCursor;
+  if (menuCursor >= scrollOffset + ANT_MENU_ROWS)
+    scrollOffset = menuCursor - ANT_MENU_ROWS + 1;
+
+  u8g2.firstPage();
+  do {
+    // ── Titelzeile ──
+    u8g2.setFont(u8g2_font_6x10_tf);
+    char bandName[8] = "---";
+    if (lastBandId >= 0 && lastBandId < MAX_BANDS && bands[lastBandId].valid)
+      strncpy(bandName, bands[lastBandId].name, 7);
+    snprintf(buf, sizeof(buf), "Ant wahlen [%s]", bandName);
+    u8g2.drawStr(0, 9, buf);
+    u8g2.drawHLine(0, 11, 128);
+
+    // ── Antennen-Liste ──
+    u8g2.setFont(u8g2_font_5x7_tf);
+    for (uint8_t i = 0; i < ANT_MENU_ROWS; i++) {
+      uint8_t listIdx = scrollOffset + i;
+      if (listIdx >= menuAntCount) break;
+
+      uint8_t aid = menuAntIds[listIdx];
+      uint8_t y   = 22 + i * 10;
+      bool    isSelected = (listIdx == menuCursor);
+      bool    isActive   = (aid == curAntId);
+
+      if (isSelected) {
+        u8g2.drawBox(0, y - 8, 128, 9);
+        u8g2.setDrawColor(0);
+      }
+
+      // Cursor-Pfeil
+      u8g2.drawStr(0, y, isSelected ? ">" : " ");
+
+      // Antennenname (max 15 Zeichen)
+      char aname[16] = "---";
+      if (aid > 0 && aid <= MAX_ANTENNAS && antennas[aid-1].valid)
+        truncStr(aname, antennas[aid-1].name, 15);
+      u8g2.drawStr(6, y, aname);
+
+      // [akt] Markierung wenn das die aktuell geschaltete Antenne ist
+      if (isActive) {
+        u8g2.drawStr(96, y, "[akt]");
+      }
+
+      if (isSelected) u8g2.setDrawColor(1);
+    }
+
+    // ── Scrollbalken ──
+    if (menuAntCount > ANT_MENU_ROWS) {
+      uint8_t barH = (ANT_MENU_ROWS * 40) / menuAntCount;
+      uint8_t barY = 12 + (scrollOffset * 40) / menuAntCount;
+      u8g2.drawBox(126, 12, 2, barH);
+      u8g2.drawFrame(126, barY, 2, barH);
+    }
+
+    // ── Fußzeile ──
+    u8g2.drawHLine(0, 53, 128);
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(0, 63, "[Btn]=Wahlen  Drehen=Navig.");
+
+  } while (u8g2.nextPage());
+}
+
+// ─── Bestätigungsdialog ────────────────────────────────────────────────────
+
+void displayDrawConfirm() {
+  if (menuCursor >= menuAntCount) { menuState = MENU_ANT_SELECT; return; }
+  uint8_t aid = menuAntIds[menuCursor];
+  char aname[20] = "---";
+  if (aid > 0 && aid <= MAX_ANTENNAS && antennas[aid-1].valid)
+    truncStr(aname, antennas[aid-1].name, 19);
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 10, "Antenne schalten?");
+    u8g2.drawHLine(0, 13, 128);
+    u8g2.drawStr(4, 26, aname);
+
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(0, 40, "Port A wird umgeschaltet.");
+
+    u8g2.drawHLine(0, 50, 128);
+    // Zwei Buttons: [JA] links, [NEIN] rechts
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr( 4, 63, "[Btn]=JA");
+    u8g2.drawStr(72, 63, "Drehen=NEIN");
+  } while (u8g2.nextPage());
+}
+
+// ─── Antennen-Liste für aktuelles Band aufbauen ────────────────────────────
+
+void menuBuildAntList() {
+  menuAntCount = 0;
+  if (lastBandId < 0) {
+    // Kein Band → alle gültigen Antennen anzeigen
+    for (uint8_t i = 0; i < MAX_ANTENNAS; i++) {
+      if (antennas[i].valid && menuAntCount < MAX_ANTENNAS)
+        menuAntIds[menuAntCount++] = antennas[i].id;
+    }
+    return;
+  }
+  uint16_t bandBit = (1u << lastBandId);
+  for (uint8_t i = 0; i < MAX_ANTENNAS; i++) {
+    if (!antennas[i].valid) continue;
+    if (antennas[i].txMask & bandBit) {
+      menuAntIds[menuAntCount++] = antennas[i].id;
+    }
+  }
+  // Fallback: wenn keine Antenne für das Band konfiguriert, alle zeigen
+  if (menuAntCount == 0) {
+    for (uint8_t i = 0; i < MAX_ANTENNAS; i++) {
+      if (antennas[i].valid && menuAntCount < MAX_ANTENNAS)
+        menuAntIds[menuAntCount++] = antennas[i].id;
+    }
+  }
+}
+
+// ─── Antenne tatsächlich schalten ─────────────────────────────────────────
+
+void menuSelectAntenna(uint8_t antId) {
+  if (antId == 0 || antId > MAX_ANTENNAS) return;
+  uint8_t bandId = (lastBandId >= 0) ? (uint8_t)lastBandId : portBand[AG_RADIO_PORT - 1];
+  webLog("[DISP] Manuelle Antennenwahl: Ant %d (%s)",
+         antId,
+         (antId <= MAX_ANTENNAS && antennas[antId-1].valid) ? antennas[antId-1].name : "?");
+  checkAndSignalConflict(antId);
+  setAGPort(AG_RADIO_PORT, bandId, antId);
+  ssePushStatus();
+}
+
+// ─── Encoder & Taster auswerten ───────────────────────────────────────────
+
+void menuHandleEncoder() {
+  // ── Drehgeber ──
+  int8_t delta = 0;
+  noInterrupts();
+  delta    = encDelta;
+  encDelta = 0;
+  interrupts();
+
+  // Nur auf volle Rastschritte reagieren (je nach Encoder 2 oder 4 Pulse/Raste)
+  static int8_t accumulator = 0;
+  accumulator += delta;
+  int8_t steps = accumulator / 2;   // bei 2 Pulsen/Raste; bei 4 Pulsen → / 4
+  accumulator %= 2;
+
+  if (steps != 0) {
+    menuLastAction  = millis();
+    dispNeedsRedraw = true;
+
+    switch (menuState) {
+      case MENU_STATUS:
+        // Drehen öffnet Antennen-Menü
+        menuBuildAntList();
+        // Cursor auf aktuelle Antenne setzen
+        menuCursor = 0;
+        for (uint8_t i = 0; i < menuAntCount; i++) {
+          if (menuAntIds[i] == currentAntId()) { menuCursor = i; break; }
+        }
+        menuState = MENU_ANT_SELECT;
+        break;
+
+      case MENU_ANT_SELECT:
+        if (steps > 0) {
+          if (menuCursor + 1 < menuAntCount) menuCursor++;
+        } else {
+          if (menuCursor > 0) menuCursor--;
+        }
+        break;
+
+      case MENU_CONFIRM:
+        // Jede Drehbewegung → Abbrechen
+        menuState = MENU_ANT_SELECT;
+        break;
+    }
+  }
+
+  // ── Taster ──
+  static bool     btnLastState = HIGH;
+  static uint32_t btnPressTime = 0;
+  bool btnNow = digitalRead(ENC_BTN_PIN);  // LOW = gedrückt (ext. Pull-up)
+
+  if (btnNow == LOW && btnLastState == HIGH) {
+    btnPressTime = millis();               // Flanke erkannt
+  }
+  if (btnNow == HIGH && btnLastState == LOW) {
+    if (millis() - btnPressTime >= ENC_DEBOUNCE_MS) {
+      // Gültiger Tastendruck
+      menuLastAction  = millis();
+      dispNeedsRedraw = true;
+
+      switch (menuState) {
+        case MENU_STATUS:
+          // Knopf im Status-Screen → Menü öffnen
+          menuBuildAntList();
+          menuCursor = 0;
+          for (uint8_t i = 0; i < menuAntCount; i++) {
+            if (menuAntIds[i] == currentAntId()) { menuCursor = i; break; }
+          }
+          menuState = MENU_ANT_SELECT;
+          break;
+
+        case MENU_ANT_SELECT:
+          // Antenne vorgewählt → Bestätigungsdialog
+          menuState = MENU_CONFIRM;
+          break;
+
+        case MENU_CONFIRM:
+          // Bestätigt → Antenne schalten, zurück zur Statusanzeige
+          if (menuCursor < menuAntCount)
+            menuSelectAntenna(menuAntIds[menuCursor]);
+          menuState = MENU_STATUS;
+          break;
+      }
+    }
+  }
+  btnLastState = btnNow;
+}
+
+#endif // DISPLAY_ENABLED
