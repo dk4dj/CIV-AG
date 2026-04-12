@@ -69,6 +69,7 @@
 #define CIV_TX_PIN      17
 #define CIV_POLL_MS     500     // Frequenz aktiv abfragen wenn kein Broadcast
 #define CIV_BROADCAST_TIMEOUT_MS 3000  // nach 3 s ohne Broadcast → aktiv pollen
+#define CIV_TIMEOUT_MS  5000    // nach 5 s ohne CI-V → TRX abgeschaltet → Port freigeben
 
 // ─── Antenna Genius ─────────────────────────────────────────────────────────
 #define AG_PORT         9007
@@ -106,6 +107,22 @@
 // ─── Web-Server ──────────────────────────────────────────────────────────────
 #define WEB_PORT        80
 #define LOG_BUF_LINES   150      // Ringpuffer für Web-Log
+
+// ─── FlexRadio-Emulation (PTT-Interlock für Antenna Genius) ─────────────────
+// Emuliert das FlexRadio VITA-49-Discovery-Protokoll damit der AG unseren
+// CI-V-Port als "FLEX"-Radio erkennt und tx=1 setzt wenn der TRX aktiv ist.
+// Der AG nutzt dies für die Konfliktverhinderung mit SmartSDR an Port B.
+// Auf 0 setzen um die Emulation zu deaktivieren.
+#define FLEX_EMULATION_ENABLED  1
+
+#define FLEX_TCP_PORT      4992   // FlexRadio API-Port
+#define FLEX_UDP_PORT      4992   // Discovery-Broadcast-Port
+#define FLEX_DISCOVERY_MS  2000   // Discovery-Broadcast-Intervall
+// Geräte-Identifikation die der AG in seiner flex list anzeigt
+#define FLEX_MODEL         "FLEX-6300"
+#define FLEX_SERIAL        "CIV-Bridge-1"
+#define FLEX_NICKNAME      "CIV-Bridge"
+#define FLEX_VERSION       "3.3.15"
 
 // ─── CI-V Konstanten ────────────────────────────────────────────────────────
 #define CIV_PREAMBLE    0xFE
@@ -195,6 +212,7 @@ static int8_t   lastBandId    = -1;
 static uint32_t lastCivRx     = 0;   // Zeitstempel letzter CI-V Frequenzempfang
 static uint32_t lastCivPoll   = 0;   // Zeitstempel letztes aktives Polling
 static double   civFreqMHz    = 0.0;
+static bool     civPortReleased = false; // true wenn Port nach Timeout freigegeben wurde
 
 // Web-Server & SSE
 WebServer webServer(WEB_PORT);
@@ -203,6 +221,20 @@ static uint8_t  logHead  = 0;
 static uint16_t logTotal = 0;
 static WiFiClient sseClient;
 static bool       sseConnected = false;
+
+#if FLEX_EMULATION_ENABLED
+// FlexRadio-Emulation
+#include <WiFiServer.h>
+static WiFiServer  flexTcpServer(FLEX_TCP_PORT);
+static WiFiClient  flexAgClient;          // eingehende Verbindung vom AG
+static bool        flexAgConnected = false;
+static uint32_t    flexLineBuf_len = 0;
+static char        flexLineBuf[128];
+static uint32_t    flexSeq         = 1;   // Sequenznummer für Antworten
+static uint32_t    flexLastDiscovery = 0;
+static bool        flexTxActive    = false; // aktueller PTT-Zustand den wir gemeldet haben
+static uint8_t     flexPktCount    = 0;     // rollierender VITA-Paketzähler
+#endif
 
 // Live-Status-Felder
 static char civAddrStr[8]    = "---";
@@ -297,10 +329,20 @@ uint64_t decodeCIVFreq(const uint8_t *data);
 int8_t freqToBandId(double freqMHz);
 uint8_t selectAntenna(uint8_t bandId);
 void setAGPort(uint8_t portId, uint8_t bandId, uint8_t antId);
+void releaseAGPort();
 void checkAndSignalConflict(uint8_t wantedAntId);
 void parseBandListLine(const String &line);
 void parseAntennaListLine(const String &line);
 void parsePortLine(const String &line);
+#if FLEX_EMULATION_ENABLED
+void flexSetup();
+void flexLoop();
+void flexSendDiscovery();
+void flexHandleTcpClient();
+void flexProcessLine(const char *line);
+void flexSendInterlockStatus(bool transmitting);
+void flexSendLine(const char *line);
+#endif
 #if DISPLAY_ENABLED
 void displaySetup();
 void displayLoop();
@@ -452,6 +494,10 @@ void setup() {
   displaySetup();
 #endif
 
+#if FLEX_EMULATION_ENABLED
+  flexSetup();
+#endif
+
   webServer.on("/",       HTTP_GET, handleWebRoot);
   webServer.on("/api",    HTTP_GET, handleApiJson);
   webServer.on("/events", HTTP_GET, handleSSE);
@@ -466,6 +512,9 @@ void loop() {
   if (ethConnected) {
     webServer.handleClient();
     handleSSEClient();
+#if FLEX_EMULATION_ENABLED
+    flexLoop();
+#endif
   }
   if (!ethConnected) return;
 
@@ -978,6 +1027,38 @@ void setAGPort(uint8_t portId, uint8_t bandId, uint8_t antId) {
   sendAGCommand(cmd);
 }
 
+// ─── Antenne freigeben (Port auf "kein Band / keine Antenne" zurücksetzen) ──
+// Wird aufgerufen wenn der CI-V Bus seit CIV_TIMEOUT_MS keine Frequenz mehr
+// geliefert hat → TRX vermutlich abgeschaltet.
+// Setzt Port auf band=0 rxant=0 txant=0 und aktiviert zur Sicherheit GPIO4.
+
+void releaseAGPort() {
+  webLog("[CIV] Timeout: TRX nicht mehr aktiv – gebe Port %d frei", AG_RADIO_PORT);
+
+  lastBandId   = -1;
+  civFreqMHz   = 0.0;
+  snprintf(civFreqStr, sizeof(civFreqStr), "---");
+
+  // Port auf Nullzustand setzen: kein Band, keine Antenne
+  if (agConnected) {
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd),
+             "port set %d auto=1 source=AUTO band=0 rxant=0 txant=0",
+             AG_RADIO_PORT);
+    sendAGCommand(cmd);
+    webLog("[AG] Port %d freigegeben (auto=1 source=AUTO band=0 ant=0)", AG_RADIO_PORT);
+  }
+
+  // GPIO4 HIGH als Sicherheitssperre (verhindert TX am TRX)
+  if (!conflictActive) {
+    conflictActive = true;
+    digitalWrite(CONFLICT_PIN, HIGH);
+    webLog("[CONF] Sicherheitssperre aktiv: GPIO%d=HIGH (TRX Timeout)", CONFLICT_PIN);
+  }
+
+  ssePushStatus();
+}
+
 void checkAndSignalConflict(uint8_t wantedAntId) {
   uint8_t otherIdx   = (AG_RADIO_PORT == 1) ? 1 : 0;
   uint8_t otherTxAnt = portTxAnt[otherIdx];
@@ -1038,8 +1119,20 @@ void handleCIV() {
     }
   }
 
-  // Aktives Polling wenn seit CIV_BROADCAST_TIMEOUT_MS kein Broadcast
-  if (civAddr != 0x00 &&
+  // CI-V-Timeout: TRX seit CIV_TIMEOUT_MS nicht mehr gehört → Port freigeben
+  // Gilt nur wenn zuvor eine Adresse gelernt und ein Band geschaltet wurde.
+  if (civAddr != 0x00 && lastCivRx > 0 &&
+      millis() - lastCivRx > CIV_TIMEOUT_MS &&
+      !civPortReleased) {
+    civPortReleased = true;
+    releaseAGPort();
+    return;
+  }
+
+  // Aktives Polling wenn seit CIV_BROADCAST_TIMEOUT_MS kein Broadcast —
+  // aber nur solange der Port NICHT bereits wegen Timeout freigegeben wurde
+  if (!civPortReleased &&
+      civAddr != 0x00 &&
       millis() - lastCivRx  > CIV_BROADCAST_TIMEOUT_MS &&
       millis() - lastCivPoll > CIV_POLL_MS) {
     lastCivPoll = millis();
@@ -1089,6 +1182,16 @@ void processCIVFrame() {
   if (freqMHz < 0.01) return;
 
   lastCivRx = millis();  // Zeitstempel aktualisieren
+
+  // War der Port wegen Timeout freigegeben? Dann Sicherheitssperre aufheben
+  // und normalen Betrieb wieder aufnehmen
+  if (civPortReleased) {
+    civPortReleased = false;
+    conflictActive  = false;
+    digitalWrite(CONFLICT_PIN, LOW);
+    webLog("[CIV] TRX wieder aktiv – Sicherheitssperre aufgehoben, GPIO%d=LOW",
+           CONFLICT_PIN);
+  }
   snprintf(civFreqStr, sizeof(civFreqStr), "%.6f MHz", freqMHz);
   civFreqMHz = freqMHz;
 
@@ -1844,3 +1947,236 @@ void menuHandleEncoder() {
 }
 
 #endif // DISPLAY_ENABLED
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  FlexRadio-Emulation
+//  Emuliert das minimal nötige FlexRadio-Protokoll damit der Antenna Genius
+//  unseren CI-V-Port als "FLEX"-Radio erkennt und bei aktivem TRX tx=1 setzt.
+//
+//  Protokoll-Ablauf:
+//  1. WT32 sendet alle 2 s einen VITA-49 Discovery-Broadcast (UDP 4992)
+//  2. AG empfängt Broadcast → erkennt "FlexRadio" im Netz
+//  3. AG baut TCP-Verbindung auf Port 4992 auf
+//  4. WT32 sendet Prologue: Versionslinie + Handle
+//  5. AG sendet "sub tx all" → WT32 antwortet mit aktuellem Interlock-Status
+//  6. Bei CI-V-Aktivität: state=PTT_REQUESTED/TRANSMITTING
+//     Bei CI-V-Timeout:   state=READY (→ AG gibt Port frei für SmartSDR)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#if FLEX_EMULATION_ENABLED
+
+// ─── VITA-49 Discovery-Broadcast ─────────────────────────────────────────
+// Paketstruktur (Big-Endian, 32-Bit-Wörter):
+//  Word 0: Header   (pkt_type=3=ExtDataWithStream, c=1, t=1, tsi=0, tsf=0)
+//  Word 1: Stream ID (0x00000000 für Discovery)
+//  Word 2: OUI      (0x001C2D00 = FlexRadio OUI in oberen 24 Bit)
+//  Word 3: Class    (InformationClassCode=0x0000, PacketClassCode=0xFFFF)
+//  Word 4..N: Payload als UTF-8 ASCII, auf 32-Bit-Wortgrenze gepaddet
+
+void flexSendDiscovery() {
+  // Payload zusammenbauen
+  char localIP[20];
+  snprintf(localIP, sizeof(localIP), "%s", ETH.localIP().toString().c_str());
+
+  char payload[256];
+  int plen = snprintf(payload, sizeof(payload),
+    "model=%s ip=%s port=%d serial=%s status=Available "
+    "version=%s nickname=%s max_panadapters=1 max_slices=2 "
+    "available_panadapters=1 available_slices=2 "
+    "inuse_ip= inuse_host= discovery_protocol_version=3.3.15",
+    FLEX_MODEL, localIP, FLEX_TCP_PORT,
+    FLEX_SERIAL, FLEX_VERSION, FLEX_NICKNAME);
+
+  // Payload auf 32-Bit-Wortgrenze auffüllen (Space-Padding)
+  while (plen % 4 != 0) payload[plen++] = ' ';
+  payload[plen] = '\0';
+
+  // packet_size in 32-Bit-Wörtern:
+  // 1 (Header) + 1 (StreamID) + 2 (ClassID) + plen/4 (Payload)
+  uint16_t pkt_size = 1 + 1 + 2 + (plen / 4);
+
+  // Header-Word aufbauen
+  // pkt_type=3 (ExtDataWithStream), c=1, t=0, tsi=0, tsf=0
+  uint32_t hdr = ((uint32_t)3 << 28)      // pkt_type
+               | ((uint32_t)1 << 27)      // c (ClassID present)
+               | ((uint32_t)flexPktCount++ << 16) // packet_count (4 bit, rollt über)
+               | pkt_size;
+  flexPktCount &= 0x0F;
+
+  uint8_t buf[320];
+  int idx = 0;
+
+  // Word 0: Header (Big-Endian)
+  buf[idx++] = (hdr >> 24) & 0xFF;
+  buf[idx++] = (hdr >> 16) & 0xFF;
+  buf[idx++] = (hdr >>  8) & 0xFF;
+  buf[idx++] =  hdr        & 0xFF;
+
+  // Word 1: Stream ID = 0
+  buf[idx++] = 0; buf[idx++] = 0; buf[idx++] = 0; buf[idx++] = 0;
+
+  // Word 2: OUI = 0x001C2D (FlexRadio), obere 8 Bit = 0
+  buf[idx++] = 0x00;
+  buf[idx++] = 0x1C;
+  buf[idx++] = 0x2D;
+  buf[idx++] = 0x00;
+
+  // Word 3: InformationClassCode=0x0000, PacketClassCode=0xFFFF
+  buf[idx++] = 0x00; buf[idx++] = 0x00;
+  buf[idx++] = 0xFF; buf[idx++] = 0xFF;
+
+  // Payload
+  memcpy(buf + idx, payload, plen);
+  idx += plen;
+
+  // Als Broadcast senden
+  WiFiUDP discUdp;
+  discUdp.beginPacket(IPAddress(255,255,255,255), FLEX_UDP_PORT);
+  discUdp.write(buf, idx);
+  discUdp.endPacket();
+}
+
+// ─── Zeile an AG-Client senden ────────────────────────────────────────────
+
+void flexSendLine(const char *line) {
+  if (!flexAgConnected || !flexAgClient.connected()) return;
+  flexAgClient.print(line);
+  flexAgClient.print("\n");
+  flexAgClient.flush();
+  webLog("[FLEX] >> %s", line);
+}
+
+// ─── Interlock-Status senden ──────────────────────────────────────────────
+// state=PTT_REQUESTED wenn CI-V aktiv (TRX eingeschaltet)
+// state=READY         wenn CI-V-Timeout (TRX abgeschaltet)
+
+void flexSendInterlockStatus(bool transmitting) {
+  char line[96];
+  if (transmitting) {
+    snprintf(line, sizeof(line),
+      "S00000000|interlock state=PTT_REQUESTED source=SW reason= tx_allowed=1");
+  } else {
+    snprintf(line, sizeof(line),
+      "S00000000|interlock state=READY source= reason= tx_allowed=1");
+  }
+  flexSendLine(line);
+  flexTxActive = transmitting;
+}
+
+// ─── Eingehende TCP-Zeile vom AG verarbeiten ─────────────────────────────
+
+void flexProcessLine(const char *line) {
+  webLog("[FLEX] << %s", line);
+
+  // AG sendet: C<seq>|<kommando>
+  if (line[0] != 'C') return;
+
+  // Sequenznummer extrahieren
+  const char *pipe = strchr(line, '|');
+  if (!pipe) return;
+  int agSeqNum = atoi(line + 1);
+  const char *cmd = pipe + 1;
+
+  // "sub tx all" → aktuellen Status senden + OK-Antwort
+  if (strncmp(cmd, "sub tx", 6) == 0) {
+    // Erst den aktuellen Status senden
+    flexSendInterlockStatus(!civPortReleased && civAddr != 0x00 && lastCivRx > 0);
+    // Dann OK-Antwort auf das sub-Kommando
+    char reply[32];
+    snprintf(reply, sizeof(reply), "R%d|00000000|", agSeqNum);
+    flexSendLine(reply);
+    return;
+  }
+
+  // Alle anderen Kommandos (client program, client gui, sub client, etc.)
+  // mit einfachem OK beantworten
+  char reply[32];
+  snprintf(reply, sizeof(reply), "R%d|00000000|", agSeqNum);
+  flexSendLine(reply);
+}
+
+// ─── TCP-Client (AG) verarbeiten ──────────────────────────────────────────
+
+void flexHandleTcpClient() {
+  // Neuen Client akzeptieren
+  if (!flexAgConnected) {
+    WiFiClient newClient = flexTcpServer.available();
+    if (newClient) {
+      flexAgClient    = newClient;
+      flexAgConnected = true;
+      flexLineBuf_len = 0;
+      flexSeq         = 1;
+      webLog("[FLEX] AG verbunden von %s", flexAgClient.remoteIP().toString().c_str());
+
+      // Prologue senden: Version + Handle
+      flexSendLine("V" FLEX_VERSION);
+      flexSendLine("H00000001");   // fester Handle – der AG merkt sich ihn
+    }
+    return;
+  }
+
+  // Verbindung verloren?
+  if (!flexAgClient.connected()) {
+    webLog("[FLEX] AG Verbindung getrennt");
+    flexAgClient.stop();
+    flexAgConnected = false;
+    flexLineBuf_len = 0;
+    return;
+  }
+
+  // Bytes lesen und zeilenweise verarbeiten
+  while (flexAgClient.available()) {
+    char c = flexAgClient.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (flexLineBuf_len > 0) {
+        flexLineBuf[flexLineBuf_len] = '\0';
+        flexProcessLine(flexLineBuf);
+        flexLineBuf_len = 0;
+      }
+      continue;
+    }
+    if (flexLineBuf_len < sizeof(flexLineBuf) - 1)
+      flexLineBuf[flexLineBuf_len++] = c;
+  }
+}
+
+// ─── PTT-Status-Update bei Zustandsänderung senden ────────────────────────
+
+void flexUpdatePttStatus() {
+  if (!flexAgConnected) return;
+
+  // TRX gilt als aktiv wenn CI-V-Adresse bekannt und zuletzt innerhalb Timeout
+  bool txNow = (!civPortReleased && civAddr != 0x00 && lastCivRx > 0);
+
+  if (txNow != flexTxActive) {
+    webLog("[FLEX] PTT-Status geändert: %s", txNow ? "TRANSMITTING" : "READY");
+    flexSendInterlockStatus(txNow);
+  }
+}
+
+// ─── Setup ────────────────────────────────────────────────────────────────
+
+void flexSetup() {
+  flexTcpServer.begin();
+  webLog("[FLEX] FlexRadio-Emulation aktiv (TCP Port %d, UDP Discovery Port %d)",
+         FLEX_TCP_PORT, FLEX_UDP_PORT);
+}
+
+// ─── Hauptschleife ────────────────────────────────────────────────────────
+
+void flexLoop() {
+  // Discovery-Broadcast regelmäßig senden
+  if (millis() - flexLastDiscovery >= FLEX_DISCOVERY_MS) {
+    flexLastDiscovery = millis();
+    flexSendDiscovery();
+  }
+
+  // TCP-Client verarbeiten
+  flexHandleTcpClient();
+
+  // PTT-Status bei Änderung senden
+  flexUpdatePttStatus();
+}
+
+#endif // FLEX_EMULATION_ENABLED
