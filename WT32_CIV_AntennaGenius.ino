@@ -2,47 +2,74 @@
  * WT32-ETH01 — CI-V Bus → Antenna Genius Bridge
  * ================================================
  * Hardware : WT32-ETH01 (ESP32 + LAN8720)
- * CI-V Bus : UART2  (GPIO 17 = TX2, GPIO 5 = RX2)
- *            CI-V ist Open-Collector → 1kΩ Pull-up auf 3.3 V empfohlen.
+ * CI-V Bus : UART2  (GPIO5 = RX2, GPIO17 = TX2)
+ *            Open-Collector → 1 kΩ Pull-up auf 3.3 V empfohlen.
  *
- * Ethernet : DHCP, Discovery via UDP Broadcast Port 9007
+ * Ethernet : DHCP, AG-Discovery via UDP-Broadcast Port 9007
  * AG API   : TCP Port 9007 (ASCII-Protokoll)
  *
- * Display  : EA DOGL128W-6 (ST7565, 128x64, Software-SPI)
- *            Bibliothek: U8g2 (Arduino Library Manager)
- *            MOSI=GPIO15  SCK=GPIO14  CS=GPIO12
- *            A0  =GPIO2   RST=GPIO33
+ * Display  : EA DOGL128W-6 (ST7565, 128×64, Software-SPI)
+ *            Bibliothek: U8g2 by olikraus (Arduino Library Manager)
+ *            SI=GPIO15  SCK=GPIO14  CS=GPIO12  A0=GPIO2  RST=GPIO33
  *
  * Encoder  : Drehencoder mit Taster
- *            ENC_A=GPIO39  ENC_B=GPIO36  BTN=GPIO35
- *            Alle drei input-only → externe 10 kΩ Pull-ups an 3.3 V erforderlich!
+ *            A=GPIO39  B=GPIO36  BTN=GPIO35
+ *            Alle input-only → externe 10 kΩ Pull-ups an 3.3 V zwingend!
+ *            GPIO36/39 teilen 270 pF interne Kapazität → B wird per Polling
+ *            gelesen (kein ISR) um Crosstalk zu vermeiden.
+ *
+ * FlexRadio: VITA-49 Discovery-Emulation (UDP/TCP Port 4992)
+ *            AG erkennt CI-V-Port als FlexRadio und setzt tx=1
+ *            wenn der Icom-TRX aktiv ist → SmartSDR sieht Konflikt
  *
  * Ablauf:
  *  1. Ethernet per DHCP initialisieren
- *  2. UDP-Broadcast auf Port 9007 lauschen → Antenna Genius finden
- *  3. TCP-Verbindung zum AG aufbauen, Prologue lesen
+ *  2. AG per UDP-Broadcast suchen → IP + Port aus Discovery-Paket
+ *  3. TCP-Verbindung zum AG (Port aus Discovery, Fallback 9007)
  *  4. sub port all → Port-Statusänderungen abonnieren
  *  5. band list + antenna list → Konfiguration einlesen
- *  6. CI-V-Frequenz empfangen oder aktiv pollen → Band → port set
+ *  6. CI-V-Frequenz empfangen oder aktiv pollen (Cmd 0x03)
+ *     → Band bestimmen → port set senden
+ *  7. CI-V-Timeout (5 s): Port freigeben, GPIO4 HIGH, CI-V Inhibit ON
+ *  8. FlexRadio-Emulation: Discovery-Broadcast alle 2 s,
+ *     TCP-Server sendet Interlock-Status bei PTT-Änderung
+ *
+ * Sicherheitsfunktionen:
+ *  - GPIO4 HIGH:      TX-Inhibit-Hardwareleitung zum TRX
+ *  - CI-V Cmd 16/66: TX-Inhibit über CI-V (neuere Icom-TRX)
+ *  - FlexRadio PTT:  state=PTT_REQUESTED wenn TRX aktiv → AG sperrt Port B
+ *  Alle drei werden synchron über setConflict() gesteuert.
  *
  * AG-Protokoll-Hinweise:
- *  - Antwortblock endet mit einer Zeile "R<seq>|0|" (leere Message)
- *  - Ohne "sub port all" sendet AG KEINE Status-Nachrichten
- *  - Status-Format: S0|<message>
- *  - Frequenzformat im CI-V: 5 BCD-Bytes, little-endian (1 Hz Auflösung)
+ *  - Kommando-Terminator: \r\n (nicht nur \r)
+ *  - write() + flush() verwenden, NICHT print()
+ *  - Antwortblock endet mit R<seq>|0| (leere Message = Blockende)
+ *  - agCfgSeq IMMER nach sendAGCommand() als agSeq-1 setzen!
+ *  - sub port all: Parameter "all" ist Pflicht; sub antenna existiert nicht
+ *
+ * Konfigurierbare Parameter (alle als #define):
+ *  DISPLAY_ENABLED       1/0   Display + Encoder aktivieren
+ *  FLEX_EMULATION_ENABLED 1/0  FlexRadio-Emulation aktivieren
+ *  CIV_BAUD              19200 Baudrate CI-V
+ *  CIV_TIMEOUT_MS        5000  Inaktivitäts-Timeout TRX
+ *  AG_RADIO_PORT         1     Genutzter AG-Port (1=A, 2=B)
+ *  ETH_POWER_PIN         16    LAN8720 Reset (-1 auf manchen Boards)
+ *  FLEX_MODEL/SERIAL     ...   Gerätekennzeichnung in AG-flex-list
+ *  DISP_CONTRAST         22    Display-Kontrast 0-63
  *
  * Bibliotheken (Board: esp32 by Espressif ≥ 2.x):
- *  - ETH.h, WiFiUdp.h, WiFiClient.h, WebServer.h (alle im ESP32-Core)
- *  - U8g2lib.h  (U8g2 by olikraus, Arduino Library Manager)
+ *  - ETH.h, WiFiUdp.h, WiFiClient.h, WiFiServer.h,
+ *    WebServer.h  (alle im ESP32-Arduino-Core enthalten)
+ *  - U8g2lib.h   (nur wenn DISPLAY_ENABLED 1)
  *
- * Board-Einstellungen in der Arduino IDE:
- *  Board      : "ESP32 Dev Module"
- *  Flash Mode : QIO / Flash Size : 4MB
+ * Board-Einstellungen Arduino IDE:
+ *  Board: ESP32 Dev Module  |  Flash: QIO 4MB
  */
 
 #include <ETH.h>
 #include <WiFiUdp.h>
 #include <WiFiClient.h>
+#include <WiFiServer.h>
 #include <WebServer.h>
 
 // ─── Display & Encoder aktivieren ───────────────────────────────────────────
@@ -76,6 +103,7 @@
 #define AG_KEEPALIVE_MS 5000
 #define AG_RECONNECT_MS 15000
 #define AG_CFG_TIMEOUT_MS 8000  // max. Wartezeit pro Config-Schritt
+#define PORT_POLL_MS    3000    // Port-Status aktiv abfragen alle N ms
 #define MAX_BANDS       16
 #define MAX_ANTENNAS    16
 #define AG_RADIO_PORT   1       // Radio-Port A = 1
@@ -185,15 +213,14 @@ static AgConfigState agCfgState   = AGCFG_IDLE;
 static uint8_t       agCfgSeq     = 0;
 static uint32_t      agCfgTimeout = 0;  // 0 = inaktiv; >0 = Ablaufzeitpunkt in ms
 
-// Sequenznummer für AG-Kommandos (1–255)
-static uint8_t  agSeq    = 1;
+// Verzögerter Config-Start nach AG-Prologue (nicht-blockierend, ersetzt delay(200))
+static uint32_t agConfigStartAt = 0;  // 0 = kein Start ausstehend; >0 = Startzeitpunkt
 static uint32_t lastPing = 0;
 
 // AG Zeilen-Empfangspuffer (nicht-blockierend)
 static String   agLineBuf;
 
 // Gesammelte Antwortzeilen für laufendes Konfigurations-Kommando
-static String   agRespLines;
 
 // Port-Status
 static uint8_t  portTxAnt[2]   = {0, 0};
@@ -202,7 +229,6 @@ static uint8_t  portBand[2]    = {0, 0};
 static bool     portTx[2]      = {false, false};
 static bool     conflictActive = false;
 static uint32_t lastPortPoll   = 0;
-#define PORT_POLL_MS 3000
 
 // CI-V
 static uint8_t  civBuf[CIV_BUF_SIZE];
@@ -224,13 +250,12 @@ static bool       sseConnected = false;
 
 #if FLEX_EMULATION_ENABLED
 // FlexRadio-Emulation
-#include <WiFiServer.h>
 static WiFiServer  flexTcpServer(FLEX_TCP_PORT);
 static WiFiClient  flexAgClient;          // eingehende Verbindung vom AG
+static WiFiUDP     flexDiscUdp;           // statisch: kein Socket-Open/Close pro Broadcast
 static bool        flexAgConnected = false;
 static uint32_t    flexLineBuf_len = 0;
 static char        flexLineBuf[128];
-static uint32_t    flexSeq         = 1;   // Sequenznummer für Antworten
 static uint32_t    flexLastDiscovery = 0;
 static bool        flexTxActive    = false; // aktueller PTT-Zustand den wir gemeldet haben
 static uint8_t     flexPktCount    = 0;     // rollierender VITA-Paketzähler
@@ -282,7 +307,6 @@ static bool         dispNeedsRedraw = true;
 
 // Encoder-State (ISR-sicher)
 static volatile int8_t  encDelta   = 0;  // akkumulierte Schritte seit letztem Loop
-static volatile bool    encBtnPressed = false;
 static uint32_t         encBtnTime = 0;
 
 // ISR für Encoder Kanal A (im Loop ausgewertet wegen SPI-Konflikte)
@@ -330,6 +354,8 @@ int8_t freqToBandId(double freqMHz);
 uint8_t selectAntenna(uint8_t bandId);
 void setAGPort(uint8_t portId, uint8_t bandId, uint8_t antId);
 void releaseAGPort();
+void sendCIVTxInhibit(bool inhibit);
+void setConflict(bool active, const char *reason);
 void checkAndSignalConflict(uint8_t wantedAntId);
 void parseBandListLine(const String &line);
 void parseAntennaListLine(const String &line);
@@ -421,7 +447,14 @@ void ssePushStatus() {
   json += "\"bandB\":\"" + bandB + "\",";
   json += "\"txA\":" + String(portTx[0] ? "true" : "false") + ",";
   json += "\"txB\":" + String(portTx[1] ? "true" : "false") + ",";
-  json += "\"conflict\":" + String(conflictActive ? "true" : "false");
+  json += "\"conflict\":" + String(conflictActive ? "true" : "false") + ",";
+  json += "\"civReleased\":" + String(civPortReleased ? "true" : "false") + ",";
+#if FLEX_EMULATION_ENABLED
+  json += "\"flexConn\":" + String(flexAgConnected ? "true" : "false") + ",";
+  json += "\"flexPtt\":" + String(flexTxActive ? "true" : "false");
+#else
+  json += "\"flexConn\":false,\"flexPtt\":false";
+#endif
   json += "}";
 
   sseClient.print("event: status\ndata: ");
@@ -626,10 +659,11 @@ void connectToAG() {
 
   static uint8_t failCount = 0;
 
-  webLog("[AG] Verbinde mit %s:%d ...", agIPStr, AG_PORT);
+  uint16_t port = (agTcpPort > 0) ? agTcpPort : AG_PORT;
+  webLog("[AG] Verbinde mit %s:%d ...", agIPStr, port);
   snprintf(agStatusStr, sizeof(agStatusStr), "Verbinde...");
 
-  if (!agClient.connect(agIP, AG_PORT)) {
+  if (!agClient.connect(agIP, port)) {
     failCount++;
     webLog("[AG] Verbindung fehlgeschlagen (Versuch %d)", failCount);
     snprintf(agStatusStr, sizeof(agStatusStr), "Fehler");
@@ -649,7 +683,6 @@ void connectToAG() {
   agConfigDone = false;
   agCfgState   = AGCFG_IDLE;
   agLineBuf    = "";
-  agRespLines  = "";
   agSeq        = 1;
   lastPing     = millis();
 
@@ -685,6 +718,13 @@ void handleAGReceive() {
     agLineBuf = "";
     if (line.length() == 0) continue;
     agProcessLine(line);
+  }
+
+  // Verzögerter Config-Start nach Prologue (ersetzt delay(200), nicht-blockierend)
+  if (agConfigStartAt > 0 && millis() >= agConfigStartAt) {
+    agConfigStartAt = 0;
+    agStartConfig();
+    return;
   }
 
   // Timeout nur prüfen wenn KEINE Daten kamen und wir auf eine Antwort warten.
@@ -735,9 +775,9 @@ void agProcessLine(const String &line) {
     sscanf(line.c_str() + 1, "%15s", fw);
     snprintf(agFwStr, sizeof(agFwStr), "%s", fw);
     webLog("[AG] Prologue: %s", line.c_str());
-    // Kurze Pause damit AG bereit ist Kommandos zu empfangen
-    delay(200);
-    agStartConfig();
+    // 200 ms Pause NICHT blockierend: agConfigStartAt setzen,
+    // handleAGReceive() prüft diesen Timer in jedem Loop-Durchlauf
+    agConfigStartAt = millis() + 200;
     return;
   }
 
@@ -763,8 +803,7 @@ void agProcessLine(const String &line) {
 //     sub antenna existiert NICHT – nur: antenna, group, output, port, relay
 //  2. band list    → Bänder einlesen
 //  3. antenna list → Antennen einlesen
-//  4. port get 1   → initialer Port-A-Status
-//  5. port get 2   → initialer Port-B-Status
+//  Port-Status kommt automatisch als S0|port nach sub port all.
 
 void agStartConfig() {
   webLog("[AG] Starte Konfigurationssequenz...");
@@ -773,7 +812,6 @@ void agStartConfig() {
   antennaCount = 0;
   memset(bands,    0, sizeof(bands));
   memset(antennas, 0, sizeof(antennas));
-  agRespLines  = "";
   agCfgState   = AGCFG_WAIT_SUB_PORT;
   sendAGCommand("sub port all");
   agCfgSeq     = agSeq - 1;  // agSeq wurde in sendAGCommand bereits inkrementiert
@@ -1049,13 +1087,55 @@ void releaseAGPort() {
     webLog("[AG] Port %d freigegeben (auto=1 source=AUTO band=0 ant=0)", AG_RADIO_PORT);
   }
 
-  // GPIO4 HIGH als Sicherheitssperre (verhindert TX am TRX)
-  if (!conflictActive) {
-    conflictActive = true;
-    digitalWrite(CONFLICT_PIN, HIGH);
-    webLog("[CONF] Sicherheitssperre aktiv: GPIO%d=HIGH (TRX Timeout)", CONFLICT_PIN);
-  }
+  // GPIO4 HIGH + CI-V TX Inhibit als Sicherheitssperre
+  setConflict(true, "TRX Timeout");
 
+  ssePushStatus();
+}
+
+// ─── CI-V TX Inhibit senden (Cmd 0x16, Subcmd 0x66) ──────────────────────
+// Wird zusätzlich zu GPIO4 gesendet um neuere Icom-TRX hardwareseitig
+// am Senden zu hindern. Ältere Transceiver ignorieren das unbekannte
+// Subkommando stillschweigend.
+//
+// Frame: FE FE <trx_addr> E0 16 66 <00/01> FD
+//   00 = TX Inhibit OFF (TRX darf senden)
+//   01 = TX Inhibit ON  (TRX gesperrt)
+//
+// civAddr muss bekannt sein (wird aus dem ersten empfangenen CI-V-Frame
+// gelernt). Ist civAddr noch 0x00 (TRX unbekannt), wird kein Frame gesendet.
+
+void sendCIVTxInhibit(bool inhibit) {
+  if (civAddr == 0x00) {
+    webLog("[CIV] TX Inhibit nicht sendbar: TRX-Adresse unbekannt");
+    return;
+  }
+  uint8_t frame[8] = {
+    CIV_PREAMBLE, CIV_PREAMBLE,   // FE FE
+    civAddr,                       // Zieladresse (TRX)
+    CIV_CONTROLLER,                // Quelladresse (wir)
+    0x16,                          // Command: Set various functions
+    0x66,                          // Subcommand: TX Inhibit
+    inhibit ? 0x01 : 0x00,         // Data: 01=ON, 00=OFF
+    CIV_EOM                        // FD
+  };
+  Serial2.write(frame, sizeof(frame));
+  webLog("[CIV] TX Inhibit %s gesendet (Cmd 16/66 an Adresse 0x%02X)",
+         inhibit ? "ON" : "OFF", civAddr);
+}
+
+// ─── Zentrale Konflikt/Sicherheitssperre ─────────────────────────────────
+// Einzige Stelle die GPIO4 und CI-V TX Inhibit setzt — beide immer synchron.
+
+void setConflict(bool active, const char *reason) {
+  if (conflictActive == active) return;
+  conflictActive = active;
+  digitalWrite(CONFLICT_PIN, active ? HIGH : LOW);
+  if (active)
+    webLog("[CONF] Sperre aktiv:     GPIO%d=HIGH (%s)", CONFLICT_PIN, reason);
+  else
+    webLog("[CONF] Sperre aufgehoben: GPIO%d=LOW  (%s)", CONFLICT_PIN, reason);
+  sendCIVTxInhibit(active);
   ssePushStatus();
 }
 
@@ -1063,16 +1143,13 @@ void checkAndSignalConflict(uint8_t wantedAntId) {
   uint8_t otherIdx   = (AG_RADIO_PORT == 1) ? 1 : 0;
   uint8_t otherTxAnt = portTxAnt[otherIdx];
   bool conflict = (wantedAntId != 0) && (otherTxAnt == wantedAntId);
-  if (conflict != conflictActive) {
-    conflictActive = conflict;
-    digitalWrite(CONFLICT_PIN, conflict ? HIGH : LOW);
-    if (conflict)
-      webLog("[CONF] *** KONFLIKT: Antenne %d bereits von Port %d belegt! GPIO%d=HIGH ***",
-             wantedAntId, (AG_RADIO_PORT == 1) ? 2 : 1, CONFLICT_PIN);
-    else
-      webLog("[CONF] Konflikt aufgeloest. GPIO%d=LOW", CONFLICT_PIN);
-    ssePushStatus();
-  }
+  // setConflict() hat internen Frühausstieg bei gleichem Zustand —
+  // explizite Prüfung hier verhindert dennoch unnötigen Log-Eintrag
+  // beim ersten Bandwechsel wenn noch gar kein Konflikt vorlag.
+  if (conflict)
+    setConflict(true,  "Antenne von anderem Port belegt");
+  else if (conflictActive)
+    setConflict(false, "Konflikt aufgeloest");
 }
 
 uint8_t selectAntenna(uint8_t bandId) {
@@ -1187,10 +1264,7 @@ void processCIVFrame() {
   // und normalen Betrieb wieder aufnehmen
   if (civPortReleased) {
     civPortReleased = false;
-    conflictActive  = false;
-    digitalWrite(CONFLICT_PIN, LOW);
-    webLog("[CIV] TRX wieder aktiv – Sicherheitssperre aufgehoben, GPIO%d=LOW",
-           CONFLICT_PIN);
+    setConflict(false, "TRX wieder aktiv");
   }
   snprintf(civFreqStr, sizeof(civFreqStr), "%.6f MHz", freqMHz);
   civFreqMHz = freqMHz;
@@ -1314,6 +1388,13 @@ void handleApiJson() {
   json += "\"txA\":" + String(portTx[0] ? "true" : "false") + ",";
   json += "\"txB\":" + String(portTx[1] ? "true" : "false") + ",";
   json += "\"conflict\":" + String(conflictActive ? "true" : "false") + ",";
+  json += "\"civReleased\":" + String(civPortReleased ? "true" : "false") + ",";
+#if FLEX_EMULATION_ENABLED
+  json += "\"flexConn\":" + String(flexAgConnected ? "true" : "false") + ",";
+  json += "\"flexPtt\":" + String(flexTxActive ? "true" : "false") + ",";
+#else
+  json += "\"flexConn\":false,\"flexPtt\":false,";
+#endif
   json += "\"bands\":[";
   bool first = true;
   for (uint8_t i = 0; i < MAX_BANDS; i++) {
@@ -1397,6 +1478,7 @@ void handleWebRoot() {
     <div class="kv"><span class="label">CI-V Adresse</span><span class="val" id="civAddr">---</span></div>
     <div class="kv"><span class="label">Frequenz</span><span class="val" id="civFreq">---</span></div>
     <div class="kv"><span class="label">Aktives Band</span><span id="activeBand"><span class="badge badge-muted">---</span></span></div>
+    <div class="kv"><span class="label">TRX-Status</span><span id="civReleasedWrap"><span class="badge badge-muted">---</span></span></div>
   </div>
   <div class="card">
     <h2>Antenna Genius</h2>
@@ -1420,6 +1502,8 @@ void handleWebRoot() {
     <div class="kv"><span class="label">Port B &ndash; Band</span><span id="bandB"><span class="badge badge-muted">---</span></span></div>
     <div class="kv"><span class="label">Port B &ndash; TX</span><span id="txB"><span class="badge badge-muted">---</span></span></div>
     <div class="kv"><span class="label">Konflikt</span><span id="conflictBadge"><span class="badge badge-muted">---</span></span></div>
+    <div class="kv"><span class="label">FlexRadio</span><span id="flexConnWrap"><span class="badge badge-muted">---</span></span></div>
+    <div class="kv"><span class="label">PTT-Interlock</span><span id="flexPttWrap"><span class="badge badge-muted">---</span></span></div>
   </div>
 </div>
 <div class="grid">
@@ -1477,6 +1561,16 @@ function applyStatus(d){
   document.getElementById('civFreq').textContent=d.civFreq;
   const ab=document.getElementById('activeBand');
   ab.innerHTML=d.activeBand!=='---'?`<span class="badge badge-blue">${esc(d.activeBand)}</span>`:`<span class="badge badge-muted">---</span>`;
+  // TRX-Status (civReleased = Port wurde wegen Timeout freigegeben)
+  const crw=document.getElementById('civReleasedWrap');
+  if(crw){
+    if(d.civReleased)
+      crw.innerHTML=`<span class="badge badge-red">&#128308; TRX inaktiv &ndash; Sperre aktiv</span>`;
+    else if(d.civAddr&&d.civAddr!=='---')
+      crw.innerHTML=`<span class="badge badge-green">&#128994; TRX aktiv</span>`;
+    else
+      crw.innerHTML=`<span class="badge badge-muted">---</span>`;
+  }
   document.getElementById('agName').textContent=d.agName;
   document.getElementById('agIP').textContent=d.agIP;
   if(document.getElementById('agPort'))
@@ -1508,6 +1602,24 @@ function applyStatus(d){
   const banner=document.getElementById('conflict-banner');
   if(d.conflict){cb.innerHTML=`<span class="badge badge-red">&#9888; KONFLIKT</span>`;banner.style.display='block';}
   else{cb.innerHTML=`<span class="badge badge-green">OK</span>`;banner.style.display='none';}
+  // FlexRadio-Verbindungsstatus
+  const fcw=document.getElementById('flexConnWrap');
+  if(fcw){
+    if(d.flexConn)
+      fcw.innerHTML=`<span class="badge badge-green">&#10003; Verbunden</span>`;
+    else
+      fcw.innerHTML=`<span class="badge badge-muted">nicht verbunden</span>`;
+  }
+  // PTT-Interlock-Status
+  const fpw=document.getElementById('flexPttWrap');
+  if(fpw){
+    if(d.flexPtt)
+      fpw.innerHTML=`<span class="badge badge-tx">&#128308; PTT_REQUESTED</span>`;
+    else if(d.flexConn)
+      fpw.innerHTML=`<span class="badge badge-green">READY</span>`;
+    else
+      fpw.innerHTML=`<span class="badge badge-muted">---</span>`;
+  }
   document.querySelectorAll('#bandTable tr').forEach(tr=>{
     if(!tr.cells[1])return;
     const active=tr.cells[1].textContent===activeBandName;
@@ -2029,11 +2141,10 @@ void flexSendDiscovery() {
   memcpy(buf + idx, payload, plen);
   idx += plen;
 
-  // Als Broadcast senden
-  WiFiUDP discUdp;
-  discUdp.beginPacket(IPAddress(255,255,255,255), FLEX_UDP_PORT);
-  discUdp.write(buf, idx);
-  discUdp.endPacket();
+  // Als Broadcast senden — flexDiscUdp ist statisch, kein Socket-Open/Close nötig
+  flexDiscUdp.beginPacket(IPAddress(255,255,255,255), FLEX_UDP_PORT);
+  flexDiscUdp.write(buf, idx);
+  flexDiscUdp.endPacket();
 }
 
 // ─── Zeile an AG-Client senden ────────────────────────────────────────────
@@ -2105,7 +2216,6 @@ void flexHandleTcpClient() {
       flexAgClient    = newClient;
       flexAgConnected = true;
       flexLineBuf_len = 0;
-      flexSeq         = 1;
       webLog("[FLEX] AG verbunden von %s", flexAgClient.remoteIP().toString().c_str());
 
       // Prologue senden: Version + Handle
