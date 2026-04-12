@@ -215,6 +215,9 @@ static uint32_t      agCfgTimeout = 0;  // 0 = inaktiv; >0 = Ablaufzeitpunkt in 
 
 // Verzögerter Config-Start nach AG-Prologue (nicht-blockierend, ersetzt delay(200))
 static uint32_t agConfigStartAt = 0;  // 0 = kein Start ausstehend; >0 = Startzeitpunkt
+
+// Sequenznummer für AG-Kommandos (1–255, rollt über)
+static uint8_t  agSeq    = 1;
 static uint32_t lastPing = 0;
 
 // AG Zeilen-Empfangspuffer (nicht-blockierend)
@@ -378,6 +381,7 @@ void displayDrawConfirm();
 void menuBuildAntList();
 void menuHandleEncoder();
 void menuSelectAntenna(uint8_t antId);
+void displaySetInvert(bool invert);
 #endif
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1136,6 +1140,10 @@ void setConflict(bool active, const char *reason) {
   else
     webLog("[CONF] Sperre aufgehoben: GPIO%d=LOW  (%s)", CONFLICT_PIN, reason);
   sendCIVTxInhibit(active);
+#if DISPLAY_ENABLED
+  displaySetInvert(active);
+  dispNeedsRedraw = true;
+#endif
   ssePushStatus();
 }
 
@@ -1684,9 +1692,16 @@ static void truncStr(char *dst, const char *src, uint8_t maxLen) {
   }
 }
 
-// ─── Setup ────────────────────────────────────────────────────────────────
+// ─── Display-Inversion (Hardware-Befehl ST7565) ───────────────────────────
+// 0xA7 = Display invertieren  (Fehlerfall: Pixel-Inversion auf Controller-Ebene)
+// 0xA6 = Normaldarstellung    (Fehler behoben)
+// Kein Neuzeichnen nötig — wirkt sofort auf den sichtbaren Displayinhalt.
 
-void displaySetup() {
+void displaySetInvert(bool invert) {
+  u8g2.sendF("c", invert ? 0xA7 : 0xA6);
+}
+
+// ─── Setup ────────────────────────────────────────────────────────────────
   // Encoder-Pins
   // GPIO35/36/39: input-only, kein interner Pull-up → ext. 10 kΩ an 3.3 V nötig
   pinMode(ENC_A_PIN,   INPUT);   // ext. Pull-up erforderlich
