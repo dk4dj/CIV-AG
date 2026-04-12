@@ -1702,6 +1702,8 @@ void displaySetInvert(bool invert) {
 }
 
 // ─── Setup ────────────────────────────────────────────────────────────────
+
+void displaySetup() {
   // Encoder-Pins
   // GPIO35/36/39: input-only, kein interner Pull-up → ext. 10 kΩ an 3.3 V nötig
   pinMode(ENC_A_PIN,   INPUT);   // ext. Pull-up erforderlich
