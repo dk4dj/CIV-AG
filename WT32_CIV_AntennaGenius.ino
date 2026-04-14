@@ -134,7 +134,7 @@
 
 // ─── Web-Server ──────────────────────────────────────────────────────────────
 #define WEB_PORT        80
-#define LOG_BUF_LINES   150      // Ringpuffer für Web-Log
+#define LOG_BUF_LINES   300      // Ringpuffer für Web-Log (inkl. Zeitstempel)
 
 // ─── FlexRadio-Emulation (PTT-Interlock für Antenna Genius) ─────────────────
 // Emuliert das FlexRadio VITA-49-Discovery-Protokoll damit der AG unseren
@@ -254,14 +254,21 @@ static bool       sseConnected = false;
 #if FLEX_EMULATION_ENABLED
 // FlexRadio-Emulation
 static WiFiServer  flexTcpServer(FLEX_TCP_PORT);
-static WiFiClient  flexAgClient;          // eingehende Verbindung vom AG
-static WiFiUDP     flexDiscUdp;           // statisch: kein Socket-Open/Close pro Broadcast
-static bool        flexAgConnected = false;
-static uint32_t    flexLineBuf_len = 0;
-static char        flexLineBuf[128];
-static uint32_t    flexLastDiscovery = 0;
-static bool        flexTxActive    = false; // aktueller PTT-Zustand den wir gemeldet haben
-static uint8_t     flexPktCount    = 0;     // rollierender VITA-Paketzähler
+// FlexRadio TCP-Server: bis zu FLEX_MAX_CLIENTS Clients gleichzeitig
+// (typisch: AG auf Port 4992 + SmartSDR auf Port 4992)
+#define FLEX_MAX_CLIENTS 4
+struct FlexClient {
+  WiFiClient  tcp;
+  bool        connected  = false;
+  char        lineBuf[128];
+  uint32_t    lineBufLen = 0;
+  bool        txActive   = false; // zuletzt gesendeter PTT-Status an diesen Client
+};
+static FlexClient   flexClients[FLEX_MAX_CLIENTS];
+static WiFiUDP      flexDiscUdp;
+static uint32_t     flexLastDiscovery = 0;
+static bool         flexTxActive      = false; // globaler PTT-Zustand
+static uint8_t      flexPktCount      = 0;     // rollierender VITA-Paketzähler
 #endif
 
 // Live-Status-Felder
@@ -408,6 +415,7 @@ void webLog(const char *fmt, ...);
 void ssePushStatus();
 void handleWebRoot();
 void handleApiJson();
+void handleLogExport();
 void handleSSE();
 void handleSSEClient();
 void discoverAntennaGenius();
@@ -439,7 +447,8 @@ void flexSetup();
 void flexLoop();
 void flexSendDiscovery();
 void flexHandleTcpClient();
-void flexProcessLine(const char *line);
+void flexProcessLine(uint8_t idx, const char *line);
+void flexSendLineTo(uint8_t idx, const char *line);
 void flexSendInterlockStatus(bool transmitting);
 void flexSendLine(const char *line);
 #endif
@@ -460,6 +469,13 @@ void displaySetInvert(bool invert);
 // ═══════════════════════════════════════════════════════════════════════════
 
 void webLog(const char *fmt, ...) {
+  // Zeitstempel mm:ss.mmm seit Boot voranstellen
+  uint32_t ms  = millis();
+  uint32_t sec = ms / 1000;
+  char tsbuf[12];
+  snprintf(tsbuf, sizeof(tsbuf), "%02lu:%02lu.%03lu ",
+           sec / 60, sec % 60, ms % 1000);
+
   char buf[256];
   va_list args;
   va_start(args, fmt);
@@ -467,13 +483,18 @@ void webLog(const char *fmt, ...) {
   va_end(args);
   int len = strlen(buf);
   while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = '\0';
-  Serial.println(buf);
-  logLines[logHead] = String(buf);
+
+  // Zeitstempel + Nachricht zusammensetzen
+  char entry[270];
+  snprintf(entry, sizeof(entry), "%s%s", tsbuf, buf);
+
+  Serial.println(entry);
+  logLines[logHead] = String(entry);
   logHead = (logHead + 1) % LOG_BUF_LINES;
   logTotal++;
   if (sseConnected && sseClient.connected()) {
     sseClient.print("event: log\ndata: ");
-    sseClient.print(buf);
+    sseClient.print(entry);
     sseClient.print("\n\n");
   }
 }
@@ -525,7 +546,8 @@ void ssePushStatus() {
   json += "\"conflict\":" + String(conflictActive ? "true" : "false") + ",";
   json += "\"civReleased\":" + String(civPortReleased ? "true" : "false") + ",";
 #if FLEX_EMULATION_ENABLED
-  json += "\"flexConn\":" + String(flexAgConnected ? "true" : "false") + ",";
+  { uint8_t _fc=0; for(uint8_t i=0;i<FLEX_MAX_CLIENTS;i++) if(flexClients[i].connected)_fc++;
+  json += "\"flexConn\":" + String(_fc > 0 ? "true" : "false") + ","; }
   json += "\"flexPtt\":" + String(flexTxActive ? "true" : "false");
 #else
   json += "\"flexConn\":false,\"flexPtt\":false";
@@ -609,6 +631,7 @@ void setup() {
   webServer.on("/",       HTTP_GET, handleWebRoot);
   webServer.on("/api",    HTTP_GET, handleApiJson);
   webServer.on("/events", HTTP_GET, handleSSE);
+  webServer.on("/log",    HTTP_GET, handleLogExport);
   webServer.onNotFound([]() { webServer.send(404, "text/plain", "Not found"); });
 }
 
@@ -1436,6 +1459,45 @@ void handleSSEClient() {
   }
 }
 
+// ─── Log-Export als Textdatei ─────────────────────────────────────────────
+// GET /log  →  alle Einträge als text/plain, UTF-8
+// Content-Disposition: attachment → Browser öffnet Speichern-Dialog
+
+void handleLogExport() {
+  char fname[40];
+  snprintf(fname, sizeof(fname), "wt32-bridge-%lus.log", millis() / 1000);
+
+  // Inhalt vollständig aufbauen — ESP32 WebServer sendet alles in einem HTTP-Response
+  String body;
+  body.reserve(8192);
+
+  char hdr[256];
+  snprintf(hdr, sizeof(hdr),
+    "# WT32-ETH01 CI-V -> Antenna Genius Bridge\r\n"
+    "# IP: %s  Uptime: %lu s  Eintraege: %u\r\n"
+    "# AG: %s (%s)  FW: %s\r\n"
+    "#\r\n",
+    ETH.localIP().toString().c_str(),
+    millis() / 1000,
+    (logTotal < LOG_BUF_LINES) ? logTotal : (uint16_t)LOG_BUF_LINES,
+    agNameStr, agIPStr, agFwStr);
+  body += hdr;
+
+  uint16_t count = (logTotal < LOG_BUF_LINES) ? logTotal : LOG_BUF_LINES;
+  uint8_t  start = (logTotal < LOG_BUF_LINES) ? 0 : logHead;
+  for (uint16_t i = 0; i < count; i++) {
+    uint8_t idx = (start + i) % LOG_BUF_LINES;
+    body += logLines[idx];
+    body += "\r\n";
+  }
+
+  webServer.sendHeader("Content-Disposition",
+                       String("attachment; filename=\"") + fname + "\"");
+  webServer.sendHeader("Cache-Control", "no-cache");
+  webServer.send(200, "text/plain; charset=utf-8", body);
+  webLog("[WEB] Log-Export: %d Zeilen als %s (%u Bytes)", count, fname, body.length());
+}
+
 void handleApiJson() {
   String antA = "---", antB = "---";
   uint8_t ia = portTxAnt[0], ib = portTxAnt[1];
@@ -1469,7 +1531,8 @@ void handleApiJson() {
   json += "\"conflict\":" + String(conflictActive ? "true" : "false") + ",";
   json += "\"civReleased\":" + String(civPortReleased ? "true" : "false") + ",";
 #if FLEX_EMULATION_ENABLED
-  json += "\"flexConn\":" + String(flexAgConnected ? "true" : "false") + ",";
+  { uint8_t _fc=0; for(uint8_t i=0;i<FLEX_MAX_CLIENTS;i++) if(flexClients[i].connected)_fc++;
+  json += "\"flexConn\":" + String(_fc > 0 ? "true" : "false") + ","; }
   json += "\"flexPtt\":" + String(flexTxActive ? "true" : "false") + ",";
 #else
   json += "\"flexConn\":false,\"flexPtt\":false,";
@@ -1598,7 +1661,9 @@ void handleWebRoot() {
   </div>
 </div>
 <div class="card">
-  <h2>Debug-Log <span id="sseState" style="font-size:.7rem;margin-left:8px"></span></h2>
+  <h2>Debug-Log <span id="sseState" style="font-size:.7rem;margin-left:8px"></span>
+    <a href="/log" download style="float:right;font-size:.75rem;padding:3px 10px;background:var(--border);color:var(--fg);border-radius:4px;text-decoration:none;border:1px solid var(--muted)">&#11015; Log herunterladen</a>
+  </h2>
   <div id="log"></div>
 </div>
 <footer>WT32-ETH01 &bull; Live via SSE &bull; Aktualisierung automatisch</footer>
@@ -2229,19 +2294,29 @@ void flexSendDiscovery() {
   flexDiscUdp.endPacket();
 }
 
-// ─── Zeile an AG-Client senden ────────────────────────────────────────────
+// ─── Zeile an einen bestimmten Client senden ──────────────────────────────
 
 void flexSendLine(const char *line) {
-  if (!flexAgConnected || !flexAgClient.connected()) return;
-  flexAgClient.print(line);
-  flexAgClient.print("\n");
-  flexAgClient.flush();
+  // Broadcast an alle verbundenen Clients (wird intern aufgerufen)
+  // Direktaufruf mit Client-Index für gezielte Antworten
+  for (uint8_t i = 0; i < FLEX_MAX_CLIENTS; i++) {
+    if (!flexClients[i].connected) continue;
+    flexClients[i].tcp.print(line);
+    flexClients[i].tcp.print("\n");
+    flexClients[i].tcp.flush();
+  }
   webLog("[FLEX] >> %s", line);
 }
 
-// ─── Interlock-Status senden ──────────────────────────────────────────────
-// state=PTT_REQUESTED wenn CI-V aktiv (TRX eingeschaltet)
-// state=READY         wenn CI-V-Timeout (TRX abgeschaltet)
+void flexSendLineTo(uint8_t idx, const char *line) {
+  if (!flexClients[idx].connected) return;
+  flexClients[idx].tcp.print(line);
+  flexClients[idx].tcp.print("\n");
+  flexClients[idx].tcp.flush();
+  webLog("[FLEX:%d] >> %s", idx, line);
+}
+
+// ─── Interlock-Status an alle Clients senden ─────────────────────────────
 
 void flexSendInterlockStatus(bool transmitting) {
   char line[96];
@@ -2252,99 +2327,154 @@ void flexSendInterlockStatus(bool transmitting) {
     snprintf(line, sizeof(line),
       "S00000000|interlock state=READY source= reason= tx_allowed=1");
   }
-  flexSendLine(line);
   flexTxActive = transmitting;
+  // An alle verbundenen Clients senden, txActive pro Client merken
+  for (uint8_t i = 0; i < FLEX_MAX_CLIENTS; i++) {
+    if (!flexClients[i].connected) continue;
+    flexClients[i].tcp.print(line);
+    flexClients[i].tcp.print("\n");
+    flexClients[i].tcp.flush();
+    flexClients[i].txActive = transmitting;
+  }
+  webLog("[FLEX] >> %s", line);
+  webLog("[FLEX] Interlock: %s (civAddr=0x%02X lastCivRx=%lums ago civReleased=%d)",
+         transmitting ? "PTT_REQUESTED" : "READY",
+         civAddr,
+         lastCivRx > 0 ? millis() - lastCivRx : 0,
+         civPortReleased);
 }
 
-// ─── Eingehende TCP-Zeile vom AG verarbeiten ─────────────────────────────
+// ─── Eingehende TCP-Zeile verarbeiten ─────────────────────────────────────
 
-void flexProcessLine(const char *line) {
-  webLog("[FLEX] << %s", line);
+void flexProcessLine(uint8_t idx, const char *line) {
+  webLog("[FLEX:%d] << %s", idx, line);
 
-  // AG sendet: C<seq>|<kommando>
   if (line[0] != 'C') return;
-
-  // Sequenznummer extrahieren
   const char *pipe = strchr(line, '|');
   if (!pipe) return;
-  int agSeqNum = atoi(line + 1);
+  int seqNum = atoi(line + 1);
   const char *cmd = pipe + 1;
+  char reply[64];
 
-  // "sub tx all" → aktuellen Status senden + OK-Antwort
-  if (strncmp(cmd, "sub tx", 6) == 0) {
-    // Erst den aktuellen Status senden
-    flexSendInterlockStatus(!civPortReleased && civAddr != 0x00 && lastCivRx > 0);
-    // Dann OK-Antwort auf das sub-Kommando
-    char reply[32];
-    snprintf(reply, sizeof(reply), "R%d|00000000|", agSeqNum);
-    flexSendLine(reply);
+  // "keepalive enable" → OK, dann sofort initialen Interlock-Status senden
+  if (strncmp(cmd, "keepalive", 9) == 0) {
+    snprintf(reply, sizeof(reply), "R%d|00000000|", seqNum);
+    flexSendLineTo(idx, reply);
+    bool txNow = (!civPortReleased && civAddr != 0x00 && lastCivRx > 0);
+    // Nur an diesen Client senden (er kennt unseren Status noch nicht)
+    char status[96];
+    if (txNow) {
+      snprintf(status, sizeof(status),
+        "S00000000|interlock state=PTT_REQUESTED source=SW reason= tx_allowed=1");
+    } else {
+      snprintf(status, sizeof(status),
+        "S00000000|interlock state=READY source= reason= tx_allowed=1");
+    }
+    flexSendLineTo(idx, status);
+    flexClients[idx].txActive = txNow;
+    webLog("[FLEX:%d] Interlock nach keepalive: %s", idx,
+           txNow ? "PTT_REQUESTED" : "READY");
     return;
   }
 
-  // Alle anderen Kommandos (client program, client gui, sub client, etc.)
-  // mit einfachem OK beantworten
-  char reply[32];
-  snprintf(reply, sizeof(reply), "R%d|00000000|", agSeqNum);
-  flexSendLine(reply);
+  // "client ip" → mit unserer IP antworten
+  if (strncmp(cmd, "client ip", 9) == 0) {
+    snprintf(reply, sizeof(reply), "R%d|00000000|%s", seqNum,
+             ETH.localIP().toString().c_str());
+    flexSendLineTo(idx, reply);
+    return;
+  }
+
+  // "sub tx all" → Status an diesen Client, OK-Antwort
+  if (strncmp(cmd, "sub tx", 6) == 0) {
+    bool txNow = (!civPortReleased && civAddr != 0x00 && lastCivRx > 0);
+    char status[96];
+    if (txNow) {
+      snprintf(status, sizeof(status),
+        "S00000000|interlock state=PTT_REQUESTED source=SW reason= tx_allowed=1");
+    } else {
+      snprintf(status, sizeof(status),
+        "S00000000|interlock state=READY source= reason= tx_allowed=1");
+    }
+    flexSendLineTo(idx, status);
+    flexClients[idx].txActive = txNow;
+    snprintf(reply, sizeof(reply), "R%d|00000000|", seqNum);
+    flexSendLineTo(idx, reply);
+    webLog("[FLEX:%d] sub tx: Status gesendet (%s)", idx,
+           txNow ? "PTT_REQUESTED" : "READY");
+    return;
+  }
+
+  // Alle anderen Kommandos mit leerem OK beantworten
+  snprintf(reply, sizeof(reply), "R%d|00000000|", seqNum);
+  flexSendLineTo(idx, reply);
 }
 
-// ─── TCP-Client (AG) verarbeiten ──────────────────────────────────────────
+// ─── TCP-Clients verarbeiten (alle Slots) ─────────────────────────────────
 
 void flexHandleTcpClient() {
-  // Neuen Client akzeptieren
-  if (!flexAgConnected) {
-    WiFiClient newClient = flexTcpServer.available();
-    if (newClient) {
-      flexAgClient    = newClient;
-      flexAgConnected = true;
-      flexLineBuf_len = 0;
-      webLog("[FLEX] AG verbunden von %s", flexAgClient.remoteIP().toString().c_str());
-
-      // Prologue senden: Version + Handle
-      flexSendLine("V" FLEX_VERSION);
-      flexSendLine("H00000001");   // fester Handle – der AG merkt sich ihn
+  // Neuen Client annehmen wenn ein Slot frei ist
+  WiFiClient newClient = flexTcpServer.available();
+  if (newClient) {
+    uint8_t slot = FLEX_MAX_CLIENTS; // ungültig
+    for (uint8_t i = 0; i < FLEX_MAX_CLIENTS; i++) {
+      if (!flexClients[i].connected) { slot = i; break; }
     }
-    return;
+    if (slot < FLEX_MAX_CLIENTS) {
+      flexClients[slot].tcp       = newClient;
+      flexClients[slot].connected = true;
+      flexClients[slot].lineBufLen= 0;
+      flexClients[slot].txActive  = false;
+      webLog("[FLEX:%d] Client verbunden von %s",
+             slot, flexClients[slot].tcp.remoteIP().toString().c_str());
+      // Prologue: Version + Handle
+      flexSendLineTo(slot, "V" FLEX_VERSION);
+      flexSendLineTo(slot, "H00000001");
+    } else {
+      webLog("[FLEX] Kein freier Client-Slot — Verbindung abgewiesen");
+      newClient.stop();
+    }
   }
 
-  // Verbindung verloren?
-  if (!flexAgClient.connected()) {
-    webLog("[FLEX] AG Verbindung getrennt");
-    flexAgClient.stop();
-    flexAgConnected = false;
-    flexLineBuf_len = 0;
-    return;
-  }
+  // Alle aktiven Clients verarbeiten
+  for (uint8_t i = 0; i < FLEX_MAX_CLIENTS; i++) {
+    if (!flexClients[i].connected) continue;
 
-  // Bytes lesen und zeilenweise verarbeiten
-  while (flexAgClient.available()) {
-    char c = flexAgClient.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (flexLineBuf_len > 0) {
-        flexLineBuf[flexLineBuf_len] = '\0';
-        flexProcessLine(flexLineBuf);
-        flexLineBuf_len = 0;
-      }
+    // Verbindung verloren?
+    if (!flexClients[i].tcp.connected()) {
+      webLog("[FLEX:%d] Client getrennt", i);
+      flexClients[i].tcp.stop();
+      flexClients[i].connected  = false;
+      flexClients[i].lineBufLen = 0;
+      flexClients[i].txActive   = false;
       continue;
     }
-    if (flexLineBuf_len < sizeof(flexLineBuf) - 1)
-      flexLineBuf[flexLineBuf_len++] = c;
+
+    // Bytes lesen
+    while (flexClients[i].tcp.available()) {
+      char c = flexClients[i].tcp.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        if (flexClients[i].lineBufLen > 0) {
+          flexClients[i].lineBuf[flexClients[i].lineBufLen] = '\0';
+          flexProcessLine(i, flexClients[i].lineBuf);
+          flexClients[i].lineBufLen = 0;
+        }
+        continue;
+      }
+      if (flexClients[i].lineBufLen < sizeof(flexClients[i].lineBuf) - 1)
+        flexClients[i].lineBuf[flexClients[i].lineBufLen++] = c;
+    }
   }
 }
 
 // ─── PTT-Status-Update bei Zustandsänderung senden ────────────────────────
 
 void flexUpdatePttStatus() {
-  if (!flexAgConnected) return;
-
-  // TRX gilt als aktiv wenn CI-V-Adresse bekannt und zuletzt innerhalb Timeout
   bool txNow = (!civPortReleased && civAddr != 0x00 && lastCivRx > 0);
-
-  if (txNow != flexTxActive) {
-    webLog("[FLEX] PTT-Status geändert: %s", txNow ? "TRANSMITTING" : "READY");
-    flexSendInterlockStatus(txNow);
-  }
+  if (txNow == flexTxActive) return;
+  webLog("[FLEX] PTT-Status geändert: %s", txNow ? "PTT_REQUESTED" : "READY");
+  flexSendInterlockStatus(txNow);
 }
 
 // ─── Setup ────────────────────────────────────────────────────────────────

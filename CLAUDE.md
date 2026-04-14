@@ -1,7 +1,7 @@
 # CLAUDE.md — Development Context
 
 **Project:** WT32-ETH01 CI-V → Antenna Genius Bridge  
-**File:** `WT32_CIV_AntennaGenius.ino` (~2280 lines, single-file Arduino sketch)  
+**File:** `WT32_CIV_AntennaGenius.ino` (~2500 lines, single-file Arduino sketch)  
 **Hardware:** WT32-ETH01 (ESP32 + LAN8720 Ethernet)
 
 Read this before modifying any protocol-related code. Every section marked **CRITICAL** has caused real bugs during development.
@@ -16,12 +16,12 @@ Read this before modifying any protocol-related code. Every section marked **CRI
 loop()
  ├── webServer.handleClient()      ← always first, every iteration
  ├── handleSSEClient()
- ├── flexLoop()                    ← Discovery broadcast + TCP server
+ ├── flexLoop()                    ← Discovery broadcast + multi-client TCP server
  ├── [return if !ethConnected]
  ├── discoverAntennaGenius()       ← until AG found
  ├── connectToAG()                 ← until connected
- ├── handleAGReceive()             ← non-blocking line reader + config state machine
- ├── menuHandleEncoder()           ← optional, even during config phase
+ ├── handleAGReceive()             ← line reader + config state machine + agConfigStartAt timer
+ ├── menuHandleEncoder()           ← optional, runs even during config phase
  ├── [return if !agConfigDone]
  ├── handleCIV()                   ← UART2 reader + timeout check
  ├── sendKeepalive()
@@ -37,14 +37,14 @@ loop()
 ```
 AGCFG_IDLE → AGCFG_WAIT_SUB_PORT → AGCFG_WAIT_BAND_LIST → AGCFG_WAIT_ANTENNA_LIST → AGCFG_DONE
 ```
-Config starts 200 ms after prologue received (`agConfigStartAt` timer, non-blocking).
+Config starts 200 ms after prologue received (`agConfigStartAt` non-blocking timer).
 
 **Display menu state** (`menuState`):
 ```
-MENU_STATUS ←─── timeout/rotate/confirm ───┐
-     │ rotate/press                          │
-     ▼                                       │
-MENU_ANT_SELECT ── press ──► MENU_CONFIRM ──┘
+MENU_STATUS ←── timeout/cancel ──┐
+     │ rotate/press               │
+     ▼                            │
+MENU_ANT_SELECT ── press ──► MENU_CONFIRM ──► switch + return
 ```
 
 ---
@@ -56,45 +56,37 @@ MENU_ANT_SELECT ── press ──► MENU_CONFIRM ──┘
 C<seq>|<command>\r\n
 ```
 Use `agClient.write((const uint8_t*)buf, strlen(buf))` + `agClient.flush()`.  
-**Never use `agClient.print()`** — it buffers and may not send immediately.  
-Terminator is `\r\n` (both CR+LF). The spec says `\r` only, but firmware requires both.
+**Never use `agClient.print()`** — may buffer and not send immediately.  
+Terminator is `\r\n` (both CR+LF). The spec says `\r` only but firmware requires both.
 
 ### Response format
 ```
 R<seq>|<hex_code>|<message>\n
 ```
 - `hex_code == "0"` or `"00000000"` = success
-- Multi-line responses: one `R<seq>|0|<data>` line per entry
-- **Block terminator: `R<seq>|0|` with empty message field** — nothing after the second `|`
+- Multi-line block: one `R<seq>|0|<data>` line per entry
+- **Block terminator: `R<seq>|0|` with empty message field**
 
-### Sequence number — CRITICAL BUG
+### Sequence number — CRITICAL
 `sendAGCommand()` increments `agSeq` **after** writing. Therefore:
 ```cpp
 // CORRECT:
 sendAGCommand("some command");
 agCfgSeq = agSeq - 1;   // ← AFTER the call
 
-// WRONG — causes all responses to be silently discarded:
+// WRONG — all responses silently discarded:
 agCfgSeq = agSeq;
 sendAGCommand("some command");
 ```
-This mistake was responsible for weeks of debugging. The response arrives with the correct sequence number but `agCfgSeq` points to the next number, causing the seq-check to fail silently.
 
 ### Config sequence
-1. `sub port all` — `all` parameter mandatory; `sub antenna` does not exist in the API
-2. After success: AG sends `S0|port 1 ...` and `S0|port 2 ...` asynchronously — port status already known before any `port get`
+1. `sub port all` — `all` parameter mandatory; `sub antenna` does not exist
+2. AG sends `S0|port 1 ...` and `S0|port 2 ...` asynchronously — port status known before any `port get`
 3. `band list` — multi-line, ends with empty-message terminator
 4. `antenna list` — same pattern
-5. No `port get` needed at startup — TCP buffer exhaustion issues were caused by `port get` calls after large list responses
 
-### Port switching
-```
-port set 1 auto=0 source=MANUAL band=5 rxant=1 txant=1
-```
-`tx` and `inhibit` are read-only — cannot be set via `port set`.
-
-### AG connects to us (discovery reply port)
-`connectToAG()` uses `agTcpPort` from the discovery packet, with fallback to `AG_PORT` (9007) if `agTcpPort == 0`.
+### TCP port
+`connectToAG()` uses `agTcpPort` from the discovery packet with fallback to `AG_PORT` (9007).
 
 ---
 
@@ -104,115 +96,180 @@ port set 1 auto=0 source=MANUAL band=5 rxant=1 txant=1
 ```
 FE FE <dst> <src> <cmd> [subcommand] [data] FD
 ```
-Controller address: `0xE0`. Transceiver address: learned from first received frame (`civAddr`).
+Controller address: `0xE0`. Transceiver address: learned from first received frame.
 
-### Frequency encoding
-5 BCD bytes, little-endian, 1 Hz resolution. See `decodeCIVFreq()`.
-
-### Active polling
-When no broadcast received for `CIV_BROADCAST_TIMEOUT_MS` (3 s), sends `FE FE <addr> E0 03 FD` every `CIV_POLL_MS` (500 ms).
-
-### TX Inhibit command (Cmd 0x16, Subcmd 0x66)
+### TX Inhibit command — Cmd 0x16/0x66
 ```
 FE FE <civAddr> E0 16 66 <00/01> FD
-  00 = TX Inhibit OFF
   01 = TX Inhibit ON
+  00 = TX Inhibit OFF
 ```
-Only sent when `civAddr != 0x00` (address must be learned first). Older transceivers respond with `FA FA` (FAIL) or ignore silently — no negative effect.
+Only sent when `civAddr != 0x00`. Older transceivers respond with `FA FA` or ignore — no negative effect. **Never call `sendCIVTxInhibit()` directly — always go through `setConflict()`.**
 
-### CI-V timeout
-After `CIV_TIMEOUT_MS` (5 s) with no frames, and `civAddr != 0` and `lastCivRx > 0`:
-- `civPortReleased = true` (prevents repeated triggering)
-- `releaseAGPort()` — sends `port set N auto=1 source=AUTO band=0 rxant=0 txant=0`
+### CI-V timeout flow
+After `CIV_TIMEOUT_MS` (5 s) with `civAddr != 0` and `lastCivRx > 0`:
+- `civPortReleased = true`
+- `releaseAGPort()` → `port set N auto=1 source=AUTO band=0 rxant=0 txant=0`
 - `setConflict(true, "TRX Timeout")`
 
 On next CI-V frame: `civPortReleased = false`, `setConflict(false, "TRX wieder aktiv")`.
 
 ---
 
-## setConflict() — Single Point of Control
+## setConflict() — Single Point of Control — CRITICAL
 
-**All GPIO4, CI-V Inhibit, and SSE updates go through `setConflict()`.**  
-Never call `digitalWrite(CONFLICT_PIN, ...)` directly (except the LOW init in `setup()`).
+**Every change to GPIO4, CI-V TX Inhibit, and display inversion goes through `setConflict()`.**  
+The only exception is the LOW init in `setup()`.
 
 ```cpp
 void setConflict(bool active, const char *reason);
 ```
 
-Has internal early-exit when state doesn't change. `checkAndSignalConflict()` additionally guards against calling `setConflict(false)` when there was no active conflict (avoids spurious log entries on first band change).
+```
+setConflict(active)
+ ├── if (conflictActive == active) return   ← early exit, no spurious log entries
+ ├── conflictActive = active
+ ├── digitalWrite(CONFLICT_PIN, ...)
+ ├── webLog(...)
+ ├── sendCIVTxInhibit(active)
+ ├── displaySetInvert(active)               ← #if DISPLAY_ENABLED only
+ ├── dispNeedsRedraw = true                 ← #if DISPLAY_ENABLED only
+ └── ssePushStatus()
+```
+
+`checkAndSignalConflict()` additionally guards with `else if (conflictActive)` to avoid calling `setConflict(false)` when there was no active conflict — prevents spurious TX Inhibit OFF and log entries on first band change.
 
 **Trigger points:**
-| Trigger | Call |
-|---|---|
-| CI-V timeout | `setConflict(true, "TRX Timeout")` in `releaseAGPort()` |
-| Antenna conflict | `setConflict(true, "Antenne von anderem Port belegt")` in `checkAndSignalConflict()` |
-| TRX resumes | `setConflict(false, "TRX wieder aktiv")` in `processCIVFrame()` |
-| Conflict resolved | `setConflict(false, "Konflikt aufgeloest")` in `checkAndSignalConflict()` |
+
+| Trigger | Call | Where |
+|---|---|---|
+| CI-V timeout | `setConflict(true, "TRX Timeout")` | `releaseAGPort()` |
+| Antenna conflict | `setConflict(true, "Antenne von anderem Port belegt")` | `checkAndSignalConflict()` |
+| TRX resumes | `setConflict(false, "TRX wieder aktiv")` | `processCIVFrame()` |
+| Conflict resolved | `setConflict(false, "Konflikt aufgeloest")` | `checkAndSignalConflict()` |
 
 ---
 
-## FlexRadio Emulation Protocol
+## FlexRadio Emulation — Multi-Client
 
-### Why
-The AG uses the FlexRadio PTT mechanism for conflict detection between radio ports. By emulating a minimal FlexRadio, the WT32 can signal Port A activity to the AG, which then blocks SmartSDR on Port B from switching to the same antenna.
+### Why multi-client
+The AG connects to port 4992 to receive interlock status for its own conflict handling.
+SmartSDR **also** connects to port 4992 directly — it uses the FlexRadio internal interlock, not the AG `inhibit` flag. Both must receive `PTT_REQUESTED` independently.
 
-### Discovery broadcast (UDP → 255.255.255.255:4992)
-Sent every `FLEX_DISCOVERY_MS` (2 s) via static `flexDiscUdp` object (never re-created per call).
+**The AG sets `inhibit=1` on its port but SmartSDR ignores that.** SmartSDR only reacts to `state=PTT_REQUESTED` received directly from the TCP server it believes is a FlexRadio.
 
-VITA-49 packet structure (big-endian 32-bit words):
-```
-Word 0: Header — pkt_type=3 (ExtDataWithStream) | c=1 | packet_count(4b) | packet_size(16b)
-Word 1: Stream ID = 0x00000000
-Word 2: OUI = 0x001C2D00  (FlexRadio OUI = 0x1C2D, upper byte = 0)
-Word 3: InformationClassCode=0x0000 | PacketClassCode=0xFFFF
-Word 4+: ASCII payload, space-padded to 32-bit boundary
-```
+### Client management
+```cpp
+#define FLEX_MAX_CLIENTS 4
 
-Required payload fields: `model=` `ip=` `port=` `serial=` `status=Available` `version=` `nickname=`
-
-### TCP server exchange (port 4992)
-```
-AG connects
-← V3.3.15\n                              (version prologue)
-← H00000001\n                            (client handle, hex)
-→ C1|sub tx all\n                        (AG subscribes)
-← S00000000|interlock state=READY source= reason= tx_allowed=1\n
-← R1|00000000|\n                         (OK reply to sub)
-
-[on PTT change:]
-← S00000000|interlock state=PTT_REQUESTED source=SW reason= tx_allowed=1\n
-← S00000000|interlock state=READY source= reason= tx_allowed=1\n
+struct FlexClient {
+  WiFiClient  tcp;
+  bool        connected  = false;
+  char        lineBuf[128];
+  uint32_t    lineBufLen = 0;
+  bool        txActive   = false;  // last PTT state sent to this client
+};
+static FlexClient flexClients[FLEX_MAX_CLIENTS];
 ```
 
-All other commands (e.g. `client program`, `client gui`) answered with `R<seq>|00000000|\n`.
+Each client has its own line buffer and `txActive` state. Log entries include client index: `[FLEX:0]`, `[FLEX:1]`, etc.
+
+### Connect sequence (per client)
+```
+← V3.3.15\n              (version prologue)
+← H00000001\n            (fixed handle)
+→ C2|keepalive enable    (client sends this — AG and SmartSDR both do)
+← R2|00000000|\n
+← S00000000|interlock state=PTT_REQUESTED/READY source=SW reason= tx_allowed=1\n
+→ C3|ping
+← R3|00000000|\n
+```
+
+### Status push timing — CRITICAL
+The real FlexRadio sends `S0|interlock state=...` **proactively** after every state change, without waiting for `sub tx all`. The AG (and SmartSDR) send `keepalive enable` right after connecting, and the status is sent immediately in the `keepalive` handler. **Do not wait for `sub tx` — it may never come.**
+
+```cpp
+// keepalive handler in flexProcessLine():
+if (strncmp(cmd, "keepalive", 9) == 0) {
+    flexSendLineTo(idx, reply);          // R<seq>|00000000|
+    // push current status immediately to THIS client only:
+    flexSendLineTo(idx, status_line);
+    flexClients[idx].txActive = txNow;
+}
+```
+
+`flexSendInterlockStatus()` broadcasts to **all** connected clients.  
+`flexSendLineTo(idx, line)` sends to a **specific** client (used for per-client replies and initial status).
 
 ### PTT state mapping
-| Condition | State sent |
+| Condition | State |
 |---|---|
 | `civAddr != 0` AND `lastCivRx > 0` AND `!civPortReleased` | `PTT_REQUESTED` |
 | Otherwise | `READY` |
 
-`flexUpdatePttStatus()` is called every loop and only sends an update when state changes.
+`flexUpdatePttStatus()` runs every loop, compares against `flexTxActive`, sends only on change.
 
 ---
 
-## GPIO Reference (WT32-ETH01)
+## Display
+
+### Splash screen
+1024-byte PROGMEM array `splashBitmap[]` — original artwork scaled to 100×64 (aspect ratio preserved), centered on 128×64 canvas, 1 bpp XBM LSB-first. Drawn via `u8g2.drawXBMP(0, 0, SPLASH_W, SPLASH_H, splashBitmap)` in `displaySetup()`.
+
+### Error inversion
+```cpp
+void displaySetInvert(bool invert) {
+  u8g2.sendF("c", invert ? 0xA7 : 0xA6);  // ST7565 hardware command
+}
+```
+Called from `setConflict()` under `#if DISPLAY_ENABLED`. Instant — no redraw needed. `dispNeedsRedraw = true` is also set so the status screen refreshes with updated content after the inversion.
+
+---
+
+## Logging
+
+All log entries have a `mm:ss.mmm` timestamp prepended (relative to device boot):
+```
+02:34.567 [FLEX:0] Client verbunden von 192.168.1.221
+02:34.570 [FLEX:0] >> V3.3.15
+02:34.572 [FLEX:0] << C2|keepalive enable
+02:34.575 [FLEX:0] Interlock nach keepalive: READY
+```
+
+Ring buffer: `LOG_BUF_LINES = 300` entries. Exported via `GET /log` as `text/plain` with `Content-Disposition: attachment`. The entire log is built into a `String` and sent with a single `webServer.send()` call — do not use `webServer.client()` + `client.stop()` as this races with TCP flush on the ESP32.
+
+---
+
+## Web Endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /` | HTML dashboard with SSE auto-update |
+| `GET /api` | Full JSON snapshot |
+| `GET /events` | SSE stream (`status` and `log` events) |
+| `GET /log` | Log file download (text/plain, attachment) |
+
+JSON fields: `civAddr`, `civFreq`, `activeBand`, `agName`, `agSerial`, `agFw`, `agIP`, `agPort`, `agPorts`, `agAntennas`, `agMode`, `agUptime`, `agStatus`, `portA`, `portB`, `bandA`, `bandB`, `txA`, `txB`, `conflict`, `civReleased`, `flexConn`, `flexPtt`, `bands[]`, `antennas[]`
+
+---
+
+## GPIO Reference
 
 ### Occupied
 | GPIO | Function |
 |---|---|
-| 0 | ETH CLK input (RMII, from LAN8720) |
-| 5 | CI-V RX (UART2) |
-| 16 | ETH Power/Reset (LAN8720) — `-1` on some boards |
-| 17 | CI-V TX (UART2) |
-| 18 | ETH MDIO |
-| 19, 21, 22, 25, 26, 27 | ETH RMII (fixed, cannot be reassigned) |
-| 23 | ETH MDC |
-| 4 | Conflict/TX-inhibit output (HIGH = active) |
+| 0 | ETH CLK input (RMII) |
 | 2 | Display A0 (strapping pin, safe after boot) |
+| 4 | Conflict/TX-inhibit output (HIGH = active) |
+| 5 | CI-V RX (UART2) |
 | 12 | Display CS |
 | 14 | Display SCK |
 | 15 | Display MOSI (SI) |
+| 16 | ETH Power/Reset |
+| 17 | CI-V TX (UART2) |
+| 18 | ETH MDIO |
+| 19, 21, 22, 25, 26, 27 | ETH RMII (fixed) |
+| 23 | ETH MDC |
 | 33 | Display RST |
 | 35 | Encoder button (input-only, ext. pull-up required) |
 | 36 | Encoder B (input-only, polled, ext. pull-up required) |
@@ -221,21 +278,15 @@ All other commands (e.g. `client program`, `client gui`) answered with `R<seq>|0
 ### Free
 GPIO 1 (TX0), 3 (RX0), 32, 34
 
-### Input-only (GPIO 34, 35, 36, 39)
-No internal pull-up or pull-down. External resistors mandatory for digital use.  
-GPIO 36/39 share 270 pF internal capacitance (CAPP/CAPN pads) → Encoder B on GPIO36 is read by polling, not ISR, to avoid crosstalk.
-
 ---
 
 ## Known Issues & Limitations
 
-**Single SSE client:** Only one browser tab receives live updates. A second `/events` connection disconnects the first.
+**Single SSE client:** Only one browser tab receives live updates.
 
-**PTT resolution:** `PTT_REQUESTED` is sent whenever the TRX is powered on and CI-V frames are received — not only when actually transmitting (PTT is not observable via CI-V alone). This is a conservative approximation; the AG considers Port A busy for the entire time the Icom TRX is active.
+**PTT approximation:** `PTT_REQUESTED` is sent whenever the TRX is powered on and sending CI-V frames — not only when the PTT key is pressed (PTT key state is not observable via standard CI-V frequency broadcasts). This is conservative: Port A is considered busy for the entire time the Icom TRX is active.
 
-**AG P2P mode:** If the AG port shows `source=P2P`, `port set source=MANUAL` commands may be overridden by the P2P source. The port switch appears to work but the AG reverts immediately.
-
-**No TX mask changes:** An earlier approach manipulated antenna TX masks to block SmartSDR — this was deliberately removed. The correct long-term solution if per-antenna conflict detection is needed is the FlexRadio emulation + AG-native conflict handling now implemented.
+**SmartSDR interlock dependency:** SmartSDR must connect to our TCP server on port 4992 and receive `PTT_REQUESTED` directly. It does **not** react to the `inhibit=1` flag set by the AG on the port. The AG sets `inhibit=1` correctly but SmartSDR ignores it.
 
 ---
 
@@ -247,11 +298,16 @@ GPIO 36/39 share 270 pF internal capacitance (CAPP/CAPN pads) → Encoder B on G
 | Web UI blocked during startup | `handleClient()` inside `agConfigDone` guard | Moved to top of `loop()`, unconditional |
 | AG ignores all commands | `print()` buffering + `\r` only terminator | `write()` + `flush()` + `\r\n` |
 | All AG responses discarded | `agCfgSeq = agSeq` before `sendAGCommand()` | `agCfgSeq = agSeq - 1` after call |
-| Config hangs after `sub port all` | `sub antenna` does not exist; `all` param missing | Removed `sub antenna`; `sub port all` with `all` param |
-| Config hangs at `port get` | TCP buffer exhausted after large list responses | Removed `port get` from init; port status from `S0|port` events |
-| CI-V parser missed frames | `return` instead of `continue` in byte loop | Fixed with `continue` |
+| Config hangs at `sub port all` | `sub antenna` does not exist; `all` param missing | Removed; `sub port all` with `all` |
+| Config hangs at `port get` | TCP buffer exhausted after large list responses | Removed `port get` from init |
+| CI-V parser missed frames | `return` instead of `continue` in byte loop | Fixed |
 | Timeout fires immediately | Timeout check before data read | Moved after `!gotData` check |
-| `delay(200)` after prologue blocked loop | Blocking delay in `agProcessLine()` | Replaced with `agConfigStartAt` non-blocking timer |
-| Discovery UDP socket re-created each call | Local `WiFiUDP` object in `flexSendDiscovery()` | Made `flexDiscUdp` a static global |
-| Spurious TX Inhibit sent on first band change | `checkAndSignalConflict()` called `setConflict(false)` unconditionally | Added `else if (conflictActive)` guard |
-| `connectToAG()` used hardcoded port 9007 | Discovery-supplied port ignored | Now uses `agTcpPort` with fallback to `AG_PORT` |
+| `delay(200)` after prologue blocked loop | Blocking delay in `agProcessLine()` | Replaced with `agConfigStartAt` timer |
+| Discovery UDP socket re-created each call | Local `WiFiUDP` in `flexSendDiscovery()` | Made `flexDiscUdp` static global |
+| Spurious TX Inhibit OFF on first band change | `checkAndSignalConflict()` called `setConflict(false)` unconditionally | Added `else if (conflictActive)` guard |
+| `connectToAG()` used hardcoded port | Discovery-supplied port ignored | Now uses `agTcpPort` with fallback |
+| SmartSDR not inhibited despite AG `inhibit=1` | Single-client server — SmartSDR was rejected | Rebuilt TCP server for up to 4 clients |
+| SmartSDR never received `PTT_REQUESTED` | Waited for `sub tx all` that never came | Status pushed immediately after `keepalive enable` |
+| Log download button had no effect | `client.stop()` raced with TCP flush | Entire log built as `String`, sent with single `webServer.send()` |
+| Compilation error: `extern` vs `static` linkage | `flexProcessLine` declared `extern`, implemented `static` | Removed `static` from implementation |
+| Compilation error: `operator+` on string literals | Python replacement generated invalid lambda expression in JSON builder | Replaced with local block variable `_fc` |
