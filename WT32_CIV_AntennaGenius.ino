@@ -21,10 +21,12 @@
  * FlexRadio: Zwei-Ebenen-Implementierung:
  *   Server: VITA-49 Discovery-Emulation (UDP/TCP Port 4992)
  *           AG erkennt CI-V-Port als FlexRadio → setzt tx=1 bei aktivem TRX
- *           Bis zu 4 gleichzeitige TCP-Clients (AG + weitere)
+ *           Bis zu FLEX_MAX_CLIENTS (4) gleichzeitige TCP-Clients
+ *           Status proaktiv nach keepalive enable gesendet (kein sub tx nötig)
  *   Client: WT32 verbindet sich direkt zum echten FLEX-Radio auf Port 4992
  *           Registriert ANT-Interlock → SmartSDR TX-Inhibit bei Konflikt
- *           FLEX-Radio-IP aus VITA-49 Discovery gelernt, persistente Auswahl NVS
+ *           FLEX-Radio-IP aus VITA-49 Discovery (flexListenUdp, Port 4992)
+ *           Persistente Radio-Auswahl via NVS (Preferences)
  *
  * Ablauf:
  *  1. Ethernet per DHCP initialisieren
@@ -33,10 +35,11 @@
  *  4. sub port all → Port-Statusänderungen abonnieren
  *  5. band list + antenna list → Konfiguration einlesen
  *  6. CI-V-Frequenz empfangen oder aktiv pollen (Cmd 0x03)
+ *     → nach CIV_BROADCAST_TIMEOUT_MS (1 s) ohne Broadcast aktiv pollen
  *     → Band bestimmen → port set senden
- *  7. CI-V-Timeout (5 s): Port freigeben, GPIO4 HIGH, CI-V Inhibit ON
+ *  7. CI-V-Timeout (CIV_TIMEOUT_MS = 5 s): Port freigeben, alle Sperren aktiv
  *  8. FlexRadio-Server: Discovery-Broadcast alle 2 s,
- *     TCP-Server sendet state=PTT_REQUESTED proaktiv nach keepalive enable
+ *     TCP-Server sendet Interlock-Status proaktiv nach keepalive enable
  *  9. FlexRadio-Client: entdeckt FLEX-Radios via VITA-49 UDP-Broadcast,
  *     wählt automatisch das AG-verbundene Radio, registriert ANT-Interlock
  *
@@ -45,12 +48,19 @@
  *  - CI-V Cmd 16/66:   TX-Inhibit über CI-V (neuere Icom-TRX)
  *  - FlexRadio Server:  state=PTT_REQUESTED → AG sperrt Port B
  *  - FlexRadio Client:  interlock not_ready → SmartSDR TX-Inhibit direkt
+ *  setConflict() befüllt conflictReason (Anzeige im Web-UI)
+ *
+ * Konflikt-Erkennung:
+ *  wantedAntId merkt sich die zuletzt angeforderte Antenne unabhängig vom
+ *  AG-Status (AG setzt txant=0 bei inhibit=1). checkAndSignalConflict(0)
+ *  verwendet wantedAntId als Fallback wenn portTxAnt[AG_RADIO_PORT-1]=0.
+ *  parsePortLine() löst Re-Check bei jedem Update des anderen Ports aus.
  *
  * AG-Protokoll-Hinweise:
  *  - Kommando-Terminator: \r\n (nicht nur \r)
  *  - write() + flush() verwenden, NICHT print()
  *  - Antwortblock endet mit R<seq>|0| (leere Message = Blockende)
- *  - agCfgSeq IMMER nach sendAGCommand() als agSeq-1 setzen!
+ *  - sendAGCfgCmd() setzt agCfgSeq + agCfgTimeout immer zusammen
  *  - sub port all: Parameter "all" ist Pflicht; sub antenna existiert nicht
  *  - AG sendet kein sub tx — Status proaktiv nach keepalive enable senden
  *
@@ -58,14 +68,20 @@
  *  - type=ANT Interlock via "interlock create type=ANT name=... serial=..."
  *  - Sperren:    "interlock not_ready <id>"
  *  - Freigeben:  "interlock ready <id>"
+ *  - IP-Discovery: flexListenUdp (Port 4992, getrennt von flexDiscUdp)
  *  - Radio-Auswahl: auto via AG-Port-Nickname, NVS-Default oder manuell
- *    (Webinterface /flex-select, /flex-default oder Display-Menü)
+ *
+ * Web-Interface:
+ *  - buildStatusJson() als gemeinsame Funktion für SSE und /api
+ *  - conflictReason zeigt gesperrten TRX mit Adresse, Frequenz und Antenne
+ *  - bandA/bandB: Suche nach bands[i].id == portBand[x] (AG-Band-ID, 1-basiert)
  *
  * Konfigurierbare Parameter (alle als #define):
  *  DISPLAY_ENABLED        1/0   Display + Encoder aktivieren
  *  FLEX_EMULATION_ENABLED 1/0   FlexRadio-Emulation aktivieren
  *  CIV_BAUD               19200 Baudrate CI-V
- *  CIV_TIMEOUT_MS         5000  Inaktivitäts-Timeout TRX
+ *  CIV_BROADCAST_TIMEOUT_MS 1000 Nach 1 s ohne Broadcast aktiv pollen
+ *  CIV_TIMEOUT_MS         5000  Inaktivitäts-Timeout TRX → Port freigeben
  *  AG_RADIO_PORT          1     Genutzter AG-Port (1=A, 2=B)
  *  ETH_POWER_PIN          16    LAN8720 Reset (-1 auf manchen Boards)
  *  FLEX_MODEL/SERIAL      ...   Gerätekennzeichnung in AG-flex-list
@@ -112,7 +128,7 @@
 #define CIV_RX_PIN      5
 #define CIV_TX_PIN      17
 #define CIV_POLL_MS     500     // Frequenz aktiv abfragen wenn kein Broadcast
-#define CIV_BROADCAST_TIMEOUT_MS 3000  // nach 3 s ohne Broadcast → aktiv pollen
+#define CIV_BROADCAST_TIMEOUT_MS 1000  // nach 1 s ohne Broadcast → aktiv pollen
 #define CIV_TIMEOUT_MS  5000    // nach 5 s ohne CI-V → TRX abgeschaltet → Port freigeben
 
 // ─── Antenna Genius ─────────────────────────────────────────────────────────
@@ -259,7 +275,10 @@ static uint8_t  portTxAnt[2]   = {0, 0};
 static uint8_t  portRxAnt[2]   = {0, 0};
 static uint8_t  portBand[2]    = {0, 0};
 static bool     portTx[2]      = {false, false};
+static uint8_t  wantedAntId    = 0;   // zuletzt angeforderte Antenne für AG_RADIO_PORT
+                                       // bleibt gültig auch wenn AG txant=0 bei inhibit meldet
 static bool     conflictActive = false;
+static char     conflictReason[64] = ""; // Beschreibung des aktiven Konflikts für Web-UI
 static uint32_t lastPortPoll   = 0;
 
 // CI-V
@@ -294,7 +313,8 @@ struct FlexClient {
   bool        txActive   = false; // zuletzt gesendeter PTT-Status an diesen Client
 };
 static FlexClient   flexClients[FLEX_MAX_CLIENTS];
-static WiFiUDP      flexDiscUdp;
+static WiFiUDP      flexDiscUdp;       // Senden: eigener VITA-49 Discovery-Broadcast (kein begin())
+static WiFiUDP      flexListenUdp;     // Empfangen: SmartSDR VITA-49 Discovery-Pakete
 static uint32_t     flexLastDiscovery = 0;
 static bool         flexTxActive      = false; // globaler PTT-Zustand
 static uint8_t      flexPktCount      = 0;     // rollierender VITA-Paketzähler
@@ -315,7 +335,7 @@ static WiFiClient   flexRadioClient;
 static bool         flexRadioConnected  = false;
 static IPAddress    flexRadioIP;
 static bool         flexRadioIPKnown    = false;   // Ziel-IP bekannt (aus Auswahl)
-static uint32_t     flexRadioLastTry    = 0;
+static uint32_t     flexRadioLastTry    = FLEX_RADIO_RECONNECT_MS; // erster Versuch sobald IP bekannt
 static uint32_t     flexRadioSeq        = 1;
 static int32_t      flexRadioInterlockId = -1;     // -1 = noch nicht registriert
 static bool         flexRadioInhibit    = false;   // aktuell gesendeter Zustand
@@ -476,6 +496,7 @@ static void IRAM_ATTR encISR() {
 
 // ─── Forward Declarations ────────────────────────────────────────────────────
 void webLog(const char *fmt, ...);
+String buildStatusJson();
 void ssePushStatus();
 void handleWebRoot();
 void handleApiJson();
@@ -578,25 +599,36 @@ void webLog(const char *fmt, ...) {
 //  SSE Status-Push
 // ═══════════════════════════════════════════════════════════════════════════
 
-void ssePushStatus() {
-  if (!sseConnected || !sseClient.connected()) return;
+// ─── Gemeinsamer Status-JSON-Builder ─────────────────────────────────────
+// Wird von ssePushStatus() und handleApiJson() verwendet.
+// Gibt ein vollständiges JSON-Objekt zurück (ohne bands/antennas, die nur /api braucht).
 
+String buildStatusJson() {
   String antA = "---", antB = "---";
-  uint8_t ia = portTxAnt[0], ib = portTxAnt[1];
+  // portTxAnt[idx] ist 0 wenn AG inhibit=1 meldet. Für den eigenen Port
+  // wantedAntId als Fallback verwenden damit das Web-UI nie "---" zeigt.
+  uint8_t ia = portTxAnt[0];
+  if (ia == 0 && (AG_RADIO_PORT == 1)) ia = wantedAntId;
+  uint8_t ib = portTxAnt[1];
+  if (ib == 0 && (AG_RADIO_PORT == 2)) ib = wantedAntId;
   if (ia > 0 && ia <= MAX_ANTENNAS && antennas[ia-1].valid) antA = antennas[ia-1].name;
   else if (ia > 0) antA = "Ant " + String(ia);
   if (ib > 0 && ib <= MAX_ANTENNAS && antennas[ib-1].valid) antB = antennas[ib-1].name;
   else if (ib > 0) antB = "Ant " + String(ib);
 
+  // activeBand: lastBandId ist 0-basierter Array-Index aus freqToBandId()
   String activeBand = "---";
   if (lastBandId >= 0 && lastBandId < MAX_BANDS && bands[lastBandId].valid)
     activeBand = bands[lastBandId].name;
 
+  // bandA/bandB: portBand enthält AG-Band-ID → Suche nach bands[i].id
   String bandA = "---", bandB = "---";
-  if (portBand[0] > 0 && portBand[0] < MAX_BANDS && bands[portBand[0]].valid)
-    bandA = bands[portBand[0]].name;
-  if (portBand[1] > 0 && portBand[1] < MAX_BANDS && bands[portBand[1]].valid)
-    bandB = bands[portBand[1]].name;
+  for (uint8_t i = 0; i < MAX_BANDS; i++) {
+    if (bands[i].valid && bands[i].id == portBand[0]) { bandA = bands[i].name; break; }
+  }
+  for (uint8_t i = 0; i < MAX_BANDS; i++) {
+    if (bands[i].valid && bands[i].id == portBand[1]) { bandB = bands[i].name; break; }
+  }
 
   String json = "{";
   json += "\"civAddr\":\"" + String(civAddrStr) + "\",";
@@ -619,32 +651,45 @@ void ssePushStatus() {
   json += "\"txA\":" + String(portTx[0] ? "true" : "false") + ",";
   json += "\"txB\":" + String(portTx[1] ? "true" : "false") + ",";
   json += "\"conflict\":" + String(conflictActive ? "true" : "false") + ",";
+  json += "\"conflictReason\":\"" + String(conflictReason) + "\",";
   json += "\"civReleased\":" + String(civPortReleased ? "true" : "false") + ",";
 #if FLEX_EMULATION_ENABLED
-  { uint8_t _fc=0; for(uint8_t i=0;i<FLEX_MAX_CLIENTS;i++) if(flexClients[i].connected)_fc++;
-  json += "\"flexConn\":" + String(_fc > 0 ? "true" : "false") + ","; }
+  { uint8_t _fc = 0;
+    for (uint8_t i = 0; i < FLEX_MAX_CLIENTS; i++) if (flexClients[i].connected) _fc++;
+    json += "\"flexConn\":" + String(_fc > 0 ? "true" : "false") + ",";
+  }
   json += "\"flexPtt\":" + String(flexTxActive ? "true" : "false") + ",";
   json += "\"flexRadioConn\":" + String(flexRadioConnected ? "true" : "false") + ",";
   json += "\"flexRadioInhibit\":" + String(flexRadioInhibit ? "true" : "false") + ",";
   json += "\"flexSelectPending\":" + String(flexSelectPending ? "true" : "false") + ",";
   json += "\"flexDefaultIP\":\"" + String(flexDefaultIP) + "\",";
   json += "\"flexRadios\":[";
-  { bool first=true;
-    for(uint8_t i=0;i<FLEX_MAX_RADIOS;i++){
-      if(!flexRadioList[i].valid) continue;
-      if(!first) json+=","; first=false;
-      json+="{\"ip\":\""+flexRadioList[i].ip.toString()+"\",";
-      json+="\"nick\":\""+String(flexRadioList[i].nickname)+"\",";
-      json+="\"model\":\""+String(flexRadioList[i].model)+"\",";
-      json+="\"sel\":"+(String(flexSelectedIdx==i?"true":"false"))+"}";
+  { bool first = true;
+    for (uint8_t i = 0; i < FLEX_MAX_RADIOS; i++) {
+      if (!flexRadioList[i].valid) continue;
+      if (!first) json += ","; first = false;
+      json += "{\"ip\":\"" + flexRadioList[i].ip.toString() + "\",";
+      json += "\"nick\":\"" + String(flexRadioList[i].nickname) + "\",";
+      json += "\"model\":\"" + String(flexRadioList[i].model) + "\",";
+      json += "\"sel\":" + String(flexSelectedIdx == i ? "true" : "false") + "}";
     }
   }
   json += "]";
 #else
-  json += "\"flexConn\":false,\"flexPtt\":false,\"flexRadioConn\":false,\"flexRadioInhibit\":false,\"flexSelectPending\":false,\"flexDefaultIP\":\"\",\"flexRadios\":[]";
+  json += "\"flexConn\":false,\"flexPtt\":false,"
+          "\"flexRadioConn\":false,\"flexRadioInhibit\":false,"
+          "\"flexSelectPending\":false,\"flexDefaultIP\":\"\","
+          "\"flexRadios\":[]";
 #endif
   json += "}";
+  return json;
+}
 
+// ─── SSE-Status-Push ──────────────────────────────────────────────────────
+
+void ssePushStatus() {
+  if (!sseConnected || !sseClient.connected()) return;
+  String json = buildStatusJson();
   sseClient.print("event: status\ndata: ");
   sseClient.print(json);
   sseClient.print("\n\n");
@@ -1232,20 +1277,28 @@ void parsePortLine(const String &s) {
   if (bp) sscanf(bp + 5, "%hhu", &band);
   if (xp) sscanf(xp + 4, "%hhu", &tx);
 
-  if (portTxAnt[idx] != txant || portRxAnt[idx] != rxant ||
-      portBand[idx]  != band  || portTx[idx]    != (bool)tx) {
+  bool changed = (portTxAnt[idx] != txant || portRxAnt[idx] != rxant ||
+                  portBand[idx]  != band  || portTx[idx]    != (bool)tx);
+  const uint8_t otherPort = (AG_RADIO_PORT == 1) ? 2 : 1;
+  if (changed) {
     webLog("[AG] Port %d: band=%d txant=%d rxant=%d tx=%d",
            portId, band, txant, rxant, tx);
     portTxAnt[idx] = txant;
     portRxAnt[idx] = rxant;
     portBand[idx]  = band;
     portTx[idx]    = (bool)tx;
+
+    // Wenn der *andere* Port seine Antenne geändert hat, Konflikt neu bewerten.
+    // 0 übergeben → checkAndSignalConflict benutzt wantedAntId (letzte angeforderte
+    // Antenne), nicht portTxAnt[AG_RADIO_PORT-1] das bei inhibit=1 auf 0 steht.
+    if (portId == otherPort) {
+      checkAndSignalConflict(0);
+    }
   }
 
 #if FLEX_EMULATION_ENABLED
   // Port 2 mit source=FLEX: nickname des verbundenen FLEX-Radios merken
   // und für automatische Radio-Auswahl nutzen
-  uint8_t otherPort = (AG_RADIO_PORT == 1) ? 2 : 1;
   if (portId == otherPort) {
     char *srcp = strstr(s.c_str(), "source=FLEX");
     char *nnp  = strstr(s.c_str(), "nickname=");
@@ -1273,6 +1326,17 @@ void setAGPort(uint8_t portId, uint8_t bandId, uint8_t antId) {
            "port set %d auto=0 source=MANUAL band=%d rxant=%d txant=%d",
            portId, bandId, antId, antId);
   sendAGCommand(cmd);
+  // wantedAntId merkt sich was wir angefordert haben. portTxAnt[idx] wird
+  // vom AG auf 0 gesetzt wenn inhibit=1 — wantedAntId bleibt davon unberührt.
+  if ((uint8_t)(portId - 1) < 2 && portId == AG_RADIO_PORT) {
+    wantedAntId = antId;
+  }
+  // Optimistisches Update von portBand damit Web-UI sofort das Band zeigt.
+  // portTxAnt NICHT hier setzen — kommt aus parsePortLine sobald AG bestätigt.
+  uint8_t idx = portId - 1;
+  if (idx < 2) {
+    portBand[idx] = (uint8_t)bandId;
+  }
 }
 
 // ─── Antenne freigeben (Port auf "kein Band / keine Antenne" zurücksetzen) ──
@@ -1285,6 +1349,7 @@ void releaseAGPort() {
 
   lastBandId   = -1;
   civFreqMHz   = 0.0;
+  wantedAntId  = 0;
   snprintf(civFreqStr, sizeof(civFreqStr), "---");
 
   // Port auf Nullzustand setzen: kein Band, keine Antenne
@@ -1334,16 +1399,34 @@ void sendCIVTxInhibit(bool inhibit) {
 }
 
 // ─── Zentrale Konflikt/Sicherheitssperre ─────────────────────────────────
-// Einzige Stelle die GPIO4 und CI-V TX Inhibit setzt — beide immer synchron.
+// Einzige Stelle die GPIO4, CI-V TX Inhibit, FlexRadio Server/Client,
+// Display-Inversion und conflictReason synchron steuert.
+// conflictReason wird bei Aktivierung mit TRX-Adresse, Frequenz und
+// Antennennamen befüllt und im Web-UI (Badge + Banner) angezeigt.
 
 void setConflict(bool active, const char *reason) {
   if (conflictActive == active) return;
   conflictActive = active;
   digitalWrite(CONFLICT_PIN, active ? HIGH : LOW);
-  if (active)
-    webLog("[CONF] Sperre aktiv:     GPIO%d=HIGH (%s)", CONFLICT_PIN, reason);
-  else
+  if (active) {
+    // Gesperrten Transceiver bestimmen: CI-V (Port A) wird immer durch uns gesperrt
+    // da der FLEX-Radio über seinen eigenen Interlock informiert wird.
+    char antName[24] = "?";
+    if (wantedAntId > 0 && wantedAntId <= MAX_ANTENNAS && antennas[wantedAntId-1].valid)
+      strncpy(antName, antennas[wantedAntId-1].name, 23);
+    if (civAddr != 0x00)
+      snprintf(conflictReason, sizeof(conflictReason),
+               "CI-V 0x%02X (%s) gesperrt &ndash; Ant %s",
+               civAddr, civFreqStr, antName);
+    else
+      snprintf(conflictReason, sizeof(conflictReason),
+               "CI-V-TRX gesperrt &ndash; Ant %s", antName);
+    webLog("[CONF] Sperre aktiv:     GPIO%d=HIGH (%s) → %s",
+           CONFLICT_PIN, reason, conflictReason);
+  } else {
+    conflictReason[0] = '\0';
     webLog("[CONF] Sperre aufgehoben: GPIO%d=LOW  (%s)", CONFLICT_PIN, reason);
+  }
   sendCIVTxInhibit(active);
 #if FLEX_EMULATION_ENABLED
   flexSendInterlockStatus(active);  // AG-Server: alle verbundenen Clients
@@ -1356,13 +1439,19 @@ void setConflict(bool active, const char *reason) {
   ssePushStatus();
 }
 
-void checkAndSignalConflict(uint8_t wantedAntId) {
+// ─── Konflikt prüfen und signalisieren ───────────────────────────────────
+// wantedAnt: gewünschte Antenne für AG_RADIO_PORT.
+// Übergabe von 0 → wantedAntId wird als Fallback verwendet.
+// Hintergrund: AG setzt txant=0 wenn inhibit=1 aktiv ist. portTxAnt[idx]
+// wäre dann 0 und würde fälschlich "keine Antenne" signalisieren.
+// wantedAntId merkt sich die zuletzt angeforderte Antenne davon unabhängig.
+
+void checkAndSignalConflict(uint8_t wantedAnt) {
+  if (wantedAnt == 0) wantedAnt = wantedAntId;
+
   uint8_t otherIdx   = (AG_RADIO_PORT == 1) ? 1 : 0;
   uint8_t otherTxAnt = portTxAnt[otherIdx];
-  bool conflict = (wantedAntId != 0) && (otherTxAnt == wantedAntId);
-  // setConflict() hat internen Frühausstieg bei gleichem Zustand —
-  // explizite Prüfung hier verhindert dennoch unnötigen Log-Eintrag
-  // beim ersten Bandwechsel wenn noch gar kein Konflikt vorlag.
+  bool conflict = (wantedAnt != 0) && (otherTxAnt == wantedAnt);
   if (conflict)
     setConflict(true,  "Antenne von anderem Port belegt");
   else if (conflictActive)
@@ -1614,61 +1703,11 @@ void handleLogExport() {
 }
 
 void handleApiJson() {
-  String antA = "---", antB = "---";
-  uint8_t ia = portTxAnt[0], ib = portTxAnt[1];
-  if (ia > 0 && ia <= MAX_ANTENNAS && antennas[ia-1].valid) antA = antennas[ia-1].name;
-  else if (ia > 0) antA = "Ant " + String(ia);
-  if (ib > 0 && ib <= MAX_ANTENNAS && antennas[ib-1].valid) antB = antennas[ib-1].name;
-  else if (ib > 0) antB = "Ant " + String(ib);
-
-  String activeBand = "---";
-  if (lastBandId >= 0 && lastBandId < MAX_BANDS && bands[lastBandId].valid)
-    activeBand = bands[lastBandId].name;
-
-  String json = "{";
-  json += "\"civAddr\":\"" + String(civAddrStr) + "\",";
-  json += "\"civFreq\":\"" + String(civFreqStr) + "\",";
-  json += "\"activeBand\":\"" + activeBand + "\",";
-  json += "\"agName\":\"" + String(agNameStr) + "\",";
-  json += "\"agSerial\":\"" + String(agSerialStr) + "\",";
-  json += "\"agFw\":\"" + String(agFwStr) + "\",";
-  json += "\"agIP\":\"" + String(agIPStr) + "\",";
-  json += "\"agPort\":" + String(agTcpPort) + ",";
-  json += "\"agPorts\":" + String(agPorts) + ",";
-  json += "\"agAntennas\":" + String(agAntennas) + ",";
-  json += "\"agMode\":\"" + String(agModeStr) + "\",";
-  json += "\"agUptime\":" + String(agUptime) + ",";
-  json += "\"agStatus\":\"" + String(agStatusStr) + "\",";
-  json += "\"portA\":\"" + antA + "\",";
-  json += "\"portB\":\"" + antB + "\",";
-  json += "\"txA\":" + String(portTx[0] ? "true" : "false") + ",";
-  json += "\"txB\":" + String(portTx[1] ? "true" : "false") + ",";
-  json += "\"conflict\":" + String(conflictActive ? "true" : "false") + ",";
-  json += "\"civReleased\":" + String(civPortReleased ? "true" : "false") + ",";
-#if FLEX_EMULATION_ENABLED
-  { uint8_t _fc=0; for(uint8_t i=0;i<FLEX_MAX_CLIENTS;i++) if(flexClients[i].connected)_fc++;
-  json += "\"flexConn\":" + String(_fc > 0 ? "true" : "false") + ","; }
-  json += "\"flexPtt\":" + String(flexTxActive ? "true" : "false") + ",";
-  json += "\"flexRadioConn\":" + String(flexRadioConnected ? "true" : "false") + ",";
-  json += "\"flexRadioInhibit\":" + String(flexRadioInhibit ? "true" : "false") + ",";
-  json += "\"flexSelectPending\":" + String(flexSelectPending ? "true" : "false") + ",";
-  json += "\"flexDefaultIP\":\"" + String(flexDefaultIP) + "\",";
-  json += "\"flexRadios\":[";
-  { bool first=true;
-    for(uint8_t i=0;i<FLEX_MAX_RADIOS;i++){
-      if(!flexRadioList[i].valid) continue;
-      if(!first) json+=","; first=false;
-      json+="{\"ip\":\""+flexRadioList[i].ip.toString()+"\",";
-      json+="\"nick\":\""+String(flexRadioList[i].nickname)+"\",";
-      json+="\"model\":\""+String(flexRadioList[i].model)+"\",";
-      json+="\"sel\":"+(String(flexSelectedIdx==i?"true":"false"))+"}";
-    }
-  }
-  json += "],";
-#else
-  json += "\"flexConn\":false,\"flexPtt\":false,\"flexRadioConn\":false,\"flexRadioInhibit\":false,\"flexSelectPending\":false,\"flexDefaultIP\":\"\",\"flexRadios\":[],";
-#endif
-  json += "\"bands\":[";
+  // Status-Felder aus buildStatusJson() — identisch mit SSE-Push
+  String json = buildStatusJson();
+  // Letztes '}' entfernen, bands[] und antennas[] anhängen
+  json.remove(json.length() - 1);
+  json += ",\"bands\":[";
   bool first = true;
   for (uint8_t i = 0; i < MAX_BANDS; i++) {
     if (!bands[i].valid || bands[i].freqStop <= 0) continue;
@@ -1744,7 +1783,7 @@ void handleWebRoot() {
 </head>
 <body>
 <h1>&#128225; WT32-ETH01 &mdash; CI-V &rarr; Antenna Genius Bridge</h1>
-<div id="conflict-banner">&#9888; ANTENNEN-KONFLIKT: Ziel-Antenne bereits von anderem Port belegt! GPIO4 = HIGH</div>
+<div id="conflict-banner">&#9888; ANTENNEN-KONFLIKT &mdash; <span id="conflict-detail">Ziel-Antenne bereits von anderem Port belegt</span> &mdash; GPIO4 = HIGH</div>
 <div class="grid">
   <div class="card">
     <h2>Funkger&auml;t (CI-V)</h2>
@@ -1892,8 +1931,16 @@ function applyStatus(d){
   document.getElementById('txB').innerHTML=d.txB?`<span class="badge badge-tx">&#128308; SENDEN</span>`:`<span class="badge badge-muted">RX</span>`;
   const cb=document.getElementById('conflictBadge');
   const banner=document.getElementById('conflict-banner');
-  if(d.conflict){cb.innerHTML=`<span class="badge badge-red">&#9888; KONFLIKT</span>`;banner.style.display='block';}
-  else{cb.innerHTML=`<span class="badge badge-green">OK</span>`;banner.style.display='none';}
+  const detail=document.getElementById('conflict-detail');
+  if(d.conflict){
+    const r=d.conflictReason||'Ziel-Antenne bereits von anderem Port belegt';
+    cb.innerHTML=`<span class="badge badge-red">&#9888; KONFLIKT &ndash; ${r}</span>`;
+    if(detail) detail.innerHTML=r;
+    banner.style.display='block';
+  } else {
+    cb.innerHTML=`<span class="badge badge-green">OK</span>`;
+    banner.style.display='none';
+  }
   // FlexRadio-Server: AG-Verbindungsstatus
   const fcw=document.getElementById('flexConnWrap');
   if(fcw){
@@ -2751,8 +2798,11 @@ void flexUpdatePttStatus() {
 
 void flexSetup() {
   flexTcpServer.begin();
+  // flexDiscUdp: nur zum Senden (beginPacket/write/endPacket), kein begin() nötig
+  // flexListenUdp: nur zum Empfangen von SmartSDR VITA-49 Broadcasts auf Port 4992
+  flexListenUdp.begin(FLEX_UDP_PORT);
   // NVS: Default-FLEX-Radio-IP laden
-  flexPrefs.begin("flex", true);  // read-only
+  flexPrefs.begin("flex", true);
   String saved = flexPrefs.getString("defaultIP", "");
   flexPrefs.end();
   if (saved.length() > 0) {
@@ -2995,6 +3045,7 @@ void flexRadioProcessLine(const char *line) {
       flexRadioInterlockId = id;
       webLog("[FRINT] Interlock registriert: ID=%d", flexRadioInterlockId);
       flexRadioSendInterlock(conflictActive);
+      ssePushStatus();
     }
   }
 }
@@ -3014,23 +3065,42 @@ void flexRadioSendInterlock(bool inhibit) {
     webLog("[FRINT] TX freigegeben → ready %d", flexRadioInterlockId);
   }
   flexRadioSend(cmd);
+  ssePushStatus();
 }
 
 // ─── Verbindungs- und Empfangs-Loop ──────────────────────────────────────
 
 void flexRadioLoop() {
-  // Eingehende VITA-49 Discovery-Pakete empfangen (SmartSDR sendet alle 2 s)
-  // Eigene IP ausschließen (wir senden ebenfalls VITA-49)
-  int pktSize = flexDiscUdp.parsePacket();
+  // Eingehende VITA-49 Discovery-Pakete von SmartSDR empfangen.
+  // flexListenUdp lauscht auf Port 4992; flexDiscUdp sendet nur (getrennte Sockets
+  // damit Senden und Empfangen sich nicht gegenseitig blockieren).
+  int pktSize = flexListenUdp.parsePacket();
   if (pktSize >= 16) {
     uint8_t buf[300];
-    int rlen = flexDiscUdp.read(buf, sizeof(buf) - 1);
-    IPAddress senderIP = flexDiscUdp.remoteIP();
+    int rlen = flexListenUdp.read(buf, sizeof(buf) - 1);
+    IPAddress senderIP = flexListenUdp.remoteIP();
+    // OUI-Prüfung: Word 2 Bytes 8-10 = FlexRadio OUI 0x1C2D
+    // Eigene IP ausschließen (wir senden ebenfalls VITA-49 auf Port 4992)
     if (senderIP != ETH.localIP() &&
         rlen >= 12 && buf[8] == 0x00 && buf[9] == 0x1C && buf[10] == 0x2D) {
+      // ip=-Feld aus Payload lesen (zuverlässiger als senderIP bei NAT)
+      if (rlen >= 17) {
+        char payload[256] = {0};
+        int plen = rlen - 16;
+        if (plen > 255) plen = 255;
+        memcpy(payload, buf + 16, plen);
+        char *ipp = strstr(payload, " ip=");
+        if (ipp) {
+          char ipStr[20] = {0};
+          sscanf(ipp + 4, "%19s", ipStr);
+          IPAddress parsedIP;
+          if (parsedIP.fromString(ipStr) && parsedIP != ETH.localIP())
+            senderIP = parsedIP;
+        }
+      }
       flexRadioUpdateDiscovery(buf, rlen, senderIP);
     }
-    while (flexDiscUdp.available()) flexDiscUdp.read();
+    while (flexListenUdp.available()) flexListenUdp.read();
   }
 
   // Verbindung aufbauen wenn IP bekannt und noch nicht verbunden
@@ -3051,6 +3121,7 @@ void flexRadioLoop() {
     flexRadioSeq          = 1;
     flexRadioLineBufLen   = 0;
     webLog("[FRINT] Verbunden. Registriere Interlock...");
+    ssePushStatus();
     flexRadioSend("client program " FLEX_INTERLOCK_NAME);
     char cmd[80];
     snprintf(cmd, sizeof(cmd), "interlock create type=ANT name=%s serial=%s",
