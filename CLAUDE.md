@@ -1,10 +1,10 @@
 # CLAUDE.md — Development Context
 
 **Project:** WT32-ETH01 CI-V → Antenna Genius Bridge  
-**File:** `WT32_CIV_AntennaGenius.ino` (~3160 lines, single-file Arduino sketch)  
+**File:** `WT32_CIV_AntennaGenius.ino` (~3400 lines, single-file Arduino sketch)  
 **Hardware:** WT32-ETH01 (ESP32 + LAN8720 Ethernet)
 
-Read this before modifying any protocol-related code. Every section marked **CRITICAL** has caused real bugs during development.
+Read this before modifying any protocol-related code. Sections marked **CRITICAL** have caused real bugs during development.
 
 ---
 
@@ -14,41 +14,39 @@ Read this before modifying any protocol-related code. Every section marked **CRI
 
 ```
 loop()
- ├── webServer.handleClient()      ← always first, every iteration
+ ├── webServer.handleClient()
  ├── handleSSEClient()
- ├── flexLoop()                    ← Discovery broadcast + AG-server + FLEX-client
+ ├── flexLoop()                    ← VITA-49 broadcast + AG-server + FLEX-client
  ├── [return if !ethConnected]
  ├── discoverAntennaGenius()
  ├── connectToAG()
  ├── handleAGReceive()             ← line reader + config state machine
  ├── menuHandleEncoder()           ← #if DISPLAY_ENABLED
  ├── [return if !agConfigDone]
- ├── handleCIV()                   ← UART2 reader + timeout check
+ ├── handleCIV()                   ← UART2 reader + timeout + TX-status poll
  ├── sendKeepalive()
  ├── pollPortStatus()
  └── displayLoop()                 ← #if DISPLAY_ENABLED
 ```
 
-`flexLoop()` calls `flexHandleTcpClient()` (server for AG) + `flexRadioLoop()` (client to FLEX radio).
-
-### State machines
-
-**AG config state** (`agCfgState`):
+### AG config state machine (`agCfgState`)
 ```
-AGCFG_IDLE → AGCFG_WAIT_SUB_PORT → AGCFG_WAIT_BAND_LIST → AGCFG_WAIT_ANTENNA_LIST → AGCFG_DONE
+AGCFG_IDLE → AGCFG_WAIT_SUB_PORT → AGCFG_WAIT_BAND_LIST
+           → AGCFG_WAIT_ANTENNA_LIST → AGCFG_DONE
 ```
 Config starts 200 ms after prologue (`agConfigStartAt` non-blocking timer).
 
-**Display menu state** (`menuState`):
+### Display menu states
 ```
-MENU_STATUS ←── timeout ──────────────────────────────────┐
-     │ rotate/press                                         │
-     ▼                                                      │
-MENU_ANT_SELECT ── press ──► MENU_CONFIRM ──► switch ──────┘
-
+MENU_STATUS ←── timeout / any press from MENU_INFO ─────────────────┐
+  │ short press → MENU_ANT_SELECT                                     │
+  │ long press ≥1s → MENU_INFO                                        │
+  ▼                                                                    │
+MENU_INFO (Info-Seite: IP, CI-V, AG, FLEX)                           │
+MENU_ANT_SELECT ── press ──► MENU_CONFIRM ──► switch ────────────────┘
 MENU_FLEX_SELECT  ← flexSelectPending=true (no timeout)
-     │ press short → flexRadioSelectByIdx()
-     │ press long ≥2s → select + save NVS default
+  │ short press → select radio
+  │ long press ≥2s → select + save NVS default
 ```
 
 ---
@@ -62,57 +60,62 @@ C<seq>|<command>\r\n
 Use `agClient.write()` + `agClient.flush()`. **Never `print()`.**
 
 ### sendAGCfgCmd() — CRITICAL
-```cpp
-// WRONG — always use sendAGCfgCmd() instead:
-sendAGCommand("band list");
-agCfgSeq = agSeq - 1;
-agCfgTimeout = millis() + AG_CFG_TIMEOUT_MS;
-
-// CORRECT:
-sendAGCfgCmd("band list");
-```
-`sendAGCfgCmd()` sets `agCfgSeq = agSeq - 1` and `agCfgTimeout` atomically after the send.
-**agCfgSeq must be set AFTER sendAGCommand() because agSeq is incremented inside it.**
+Always use `sendAGCfgCmd()` for config commands — it sets `agCfgSeq = agSeq - 1` and `agCfgTimeout` atomically **after** the send. `agSeq` is incremented inside `sendAGCommand()`, so `agCfgSeq` must be set after the call, never before.
 
 ### Config sequence
 1. `sub port all` — `all` mandatory; `sub antenna` does not exist
-2. `band list` → `antenna list` — each block ends with `R<seq>|0|` (empty message)
-3. AG pushes `S0|port 1 ...` / `S0|port 2 ...` asynchronously → `parsePortLine()`
+2. `band list` → `antenna list` — each ends with `R<seq>|0|` (empty message)
+3. AG pushes `S0|port 1 ...` asynchronously → `parsePortLine()`
 
 ---
 
 ## CI-V Protocol
 
 ### Timing
-- `CIV_BROADCAST_TIMEOUT_MS = 1000` ms without broadcast → active polling (Cmd 0x03)
-- `CIV_TIMEOUT_MS = 5000` ms without any CI-V → `releaseAGPort()` + `setConflict(true)`
+- `CIV_BROADCAST_TIMEOUT_MS = 1000` ms → active freq poll (Cmd 0x03)
+- TX status poll (Cmd 0x1C/0x00) every 200 ms once `civAddr != 0`
+- `CIV_TIMEOUT_MS = 5000` ms → `releaseAGPort()` + `setConflict(true)`
+
+### TX status polling — Cmd 0x1C/0x00
+```
+→ FE FE <civAddr> E0 1C 00 FD
+← FE FE E0 <civAddr> 1C 00 <status> FD   (status: 0x00=RX, 0x01=TX)
+```
+Sets `civTransmitting`, `portTx[AG_RADIO_PORT-1]`, triggers `dispNeedsRedraw` and `ssePushStatus()`.
 
 ### TX Inhibit — Cmd 0x16/0x66
 ```
-FE FE <civAddr> E0 16 66 01/00 FD   (01=ON, 00=OFF)
+FE FE <civAddr> E0 16 66 01/00 FD
 ```
-Only sent when `civAddr != 0x00`. **Never call `sendCIVTxInhibit()` directly — always use `setConflict()`.**
+Only sent when `civAddr != 0x00`. **Never call `sendCIVTxInhibit()` directly — use `setConflict()`.**
+
+### GPIO register for pins 32–39 — CRITICAL
+GPIO 36 and 39 lie in `GPIO.in1.val`, **not** `GPIO.in`. The encoder ISR reads:
+```cpp
+uint8_t a = (GPIO.in1.val >> (ENC_A_PIN - 32)) & 1;
+uint8_t b = (GPIO.in1.val >> (ENC_B_PIN - 32)) & 1;
+```
+Using `GPIO.in` returns 0 for these pins — the encoder appears non-functional.
 
 ---
 
 ## setConflict() — Single Point of Control — CRITICAL
 
-```cpp
-void setConflict(bool active, const char *reason)
+```
+setConflict(bool active, const char *reason)
  ├── early exit if conflictActive == active
  ├── conflictActive = active
  ├── digitalWrite(CONFLICT_PIN, ...)
- ├── if active: build conflictReason string (civAddr + civFreqStr + antName)
+ ├── if active: build conflictReason (civAddr + civFreqStr + antennas[wantedAntId-1].name)
+ │   NOTE: called BEFORE wantedAntId = 0 so the antenna name is still available
  ├── webLog(...)
  ├── sendCIVTxInhibit(active)
- ├── flexSendInterlockStatus(active)   // server → AG clients  [FLEX_EMULATION_ENABLED]
- ├── flexRadioSendInterlock(active)    // client → FLEX radio  [FLEX_EMULATION_ENABLED]
- ├── displaySetInvert(active)          // [DISPLAY_ENABLED]
- ├── dispNeedsRedraw = true            // [DISPLAY_ENABLED]
+ ├── flexSendInterlockStatus(active)   → AG clients  [FLEX_EMULATION_ENABLED]
+ ├── flexRadioSendInterlock(active)    → FLEX radio  [FLEX_EMULATION_ENABLED]
+ ├── displaySetInvert(active)          [DISPLAY_ENABLED]
+ ├── dispNeedsRedraw = true            [DISPLAY_ENABLED]
  └── ssePushStatus()
 ```
-
-`conflictReason` is built from `civAddr`, `civFreqStr`, and `antennas[wantedAntId-1].name`. Displayed in the web UI badge and banner.
 
 ---
 
@@ -120,62 +123,52 @@ void setConflict(bool active, const char *reason)
 
 ### wantedAntId
 
-The AG sets `txant=0` in status messages whenever `inhibit=1`. This overwrites `portTxAnt[AG_RADIO_PORT-1]` to 0, which would cause:
-1. `checkAndSignalConflict()` to see "no antenna wanted" → no conflict detected
-2. Web UI to show `---` for antenna name
+The AG sets `txant=0` when `inhibit=1`. Without a tracking variable, `portTxAnt[AG_RADIO_PORT-1]` becomes 0, causing false "no conflict" decisions and `---` in the web UI antenna display.
 
-**Solution:** `wantedAntId` tracks the last requested antenna independently:
-- Set in `setAGPort()` for `AG_RADIO_PORT` only
-- Cleared in `releaseAGPort()` to 0
-- Never touched by `parsePortLine()` or AG status updates
+- Set in `setAGPort()` for own port only
+- Cleared **after** `setConflict(true)` in `releaseAGPort()` so `conflictReason` can show the antenna name
+- Never overwritten by `parsePortLine()` or AG status updates
 
 ### checkAndSignalConflict(wantedAnt)
 
+Conflict condition:
 ```cpp
-// Pass 0 to use wantedAntId as fallback:
-checkAndSignalConflict(0);      // from parsePortLine() re-check
-checkAndSignalConflict(antId);  // from handleCIV() / menuSelectAntenna()
+bool conflict = (wantedAnt != 0) && (otherTxAnt != 0) && (otherTxAnt == wantedAnt);
 ```
+`otherTxAnt == 0` → other port has no antenna configured → no conflict possible.
+
+Pass the explicit value whenever available (`antId` from `handleCIV`/`menuSelectAntenna`). Pass `wantedAntId` from `parsePortLine()` re-check.
 
 ### parsePortLine() re-check — CRITICAL
+Every time **the other port** changes, `checkAndSignalConflict(wantedAntId)` is called. Guard: only when `wantedAntId > 0` (own port is active). This resolves conflicts immediately when SmartSDR changes band without waiting for the next CI-V frame.
 
-Every time **the other port** changes state, `parsePortLine()` calls `checkAndSignalConflict(0)`. This ensures conflicts are detected/resolved immediately when SmartSDR changes band — without waiting for the next CI-V frame from the Icom radio.
+### source=AUTO guard
+When AG reports `source=AUTO` for own port and `wantedAntId == 0`, the `txant` value is replaced with `effectiveTxant = 0`. Prevents the last session's state from being treated as current after reboot or CIV-timeout.
 
+### Band-ID vs. array index — CRITICAL
 ```cpp
-if (portId == otherPort) {
-    checkAndSignalConflict(0);   // uses wantedAntId
-}
-```
-
-No `conflictActive` guard — runs on every port update of the other port.
-
-### Band-ID vs. Array index — CRITICAL
-
-```cpp
-// portBand[] contains AG Band-ID (1-based, from "band=N" in AG status)
-// bands[] is 0-based array with .id field
-// WRONG: bands[portBand[0]].name   ← off-by-one
+// portBand[] = AG Band-ID (1-based, from "band=N" in AG status)
+// bands[] = 0-based array with .id field matching AG Band-ID
+// WRONG:  bands[portBand[0]].name   ← off-by-one
 // CORRECT:
 for (uint8_t i = 0; i < MAX_BANDS; i++)
-    if (bands[i].valid && bands[i].id == portBand[0]) { bandA = bands[i].name; break; }
+    if (bands[i].valid && bands[i].id == portBand[0]) { ... }
 
-// lastBandId from freqToBandId() IS a 0-based array index (iterates from i=1):
+// lastBandId from freqToBandId() IS a 0-based array index:
 bands[lastBandId].name   ← correct
 ```
 
 ---
 
-## buildStatusJson() — Single JSON Source
+## Antenna Menu Filtering
 
-Both `ssePushStatus()` and `handleApiJson()` call `buildStatusJson()`. This ensures the 30-second `loadConfig()` polling and live SSE pushes always return identical field sets.
-
-`handleApiJson()` calls `buildStatusJson()`, removes the trailing `}`, and appends `bands[]` and `antennas[]`.
-
-**antA/antB fallback:**
+`menuBuildAntList()` excludes two categories:
 ```cpp
-uint8_t ia = portTxAnt[0];
-if (ia == 0 && (AG_RADIO_PORT == 1)) ia = wantedAntId;  // inhibit=1 fallback
+uint8_t activeAnt  = currentAntId();           // own active antenna
+uint8_t blockedAnt = portTxAnt[otherIdx];      // SmartSDR's active antenna
+#define ANT_BLOCKED(aid) ((aid)==activeAnt || ((aid)==blockedAnt && blockedAnt!=0))
 ```
+This prevents selecting an antenna already in use on either port — including antennas used by SmartSDR on the other port even for different bands.
 
 ---
 
@@ -183,92 +176,84 @@ if (ia == 0 && (AG_RADIO_PORT == 1)) ia = wantedAntId;  // inhibit=1 fallback
 
 ### Connect sequence
 ```
-← V3.3.15\n + H00000001\n     (prologue)
-→ C2|keepalive enable
-← R2|00000000|\n
-← S00000000|interlock state=PTT_REQUESTED/READY ...\n   ← proactive push
+← V3.3.15 + H00000001     (prologue)
+→ keepalive enable
+← R|00000000|
+← S00000000|interlock state=PTT_REQUESTED/READY ...   ← proactive push
 ```
-**Status is sent after `keepalive enable`, NOT after `sub tx all`** — the AG never sends `sub tx`.
-
-### ssePushStatus() timing
-
-`ssePushStatus()` is called from `setConflict()` and from `flexRadioSendInterlock()`. At the time `setConflict(false)` fires, `portTxAnt[AG_RADIO_PORT-1]` may still be 0 (AG hasn't confirmed yet). `wantedAntId` is used as fallback in `buildStatusJson()`.
+Status is sent **immediately after `keepalive enable`** — the AG never sends `sub tx`. `flexSendInterlockStatus()` sets `flexTxActive` to keep it in sync with the actually sent status.
 
 ---
 
 ## FlexRadio Client (SmartSDR Direct Interlock)
 
 ### UDP sockets — CRITICAL
-
-Two separate sockets prevent the ESP32 UDP send/receive conflict:
 ```cpp
-static WiFiUDP flexDiscUdp;    // send only — no begin(), used by flexSendDiscovery()
-static WiFiUDP flexListenUdp;  // receive only — begin(4992), used by flexRadioLoop()
+static WiFiUDP flexDiscUdp;    // SEND ONLY — no begin(), ephemeral port
+static WiFiUDP flexListenUdp;  // RECEIVE ONLY — begin(4992) in flexSetup()
 ```
-**Do NOT call `flexDiscUdp.begin()`** — it breaks simultaneous send.
-**`flexListenUdp.begin(4992)` is called in `flexSetup()`.**
+Do not call `flexDiscUdp.begin()` — it breaks simultaneous send/receive on ESP32.
 
 ### Protocol
 ```
 → C1|client program CIV-Bridge
-→ C2|interlock create type=ANT name=CIV-Bridge serial=DK4DJ-1
-← R2|0|<interlock_id>
-→ C3|interlock not_ready <id>   ← conflict
-→ C4|interlock ready <id>       ← resolved
+→ C2|interlock create type=ANT model=CIV-Bridge serial=DK4DJ-1 valid_antennas=
+← R2|0|000000F4             ← hex interlock ID → strtol(..., 16)
+→ C3|interlock not_ready 000000F4
+→ C4|interlock ready 000000F4
 ```
-`flexRadioSend()` is `static void` (file-scope only). Log prefix: `[FRINT]`.
+- Interlock ID is **hexadecimal** — use `strtol(p2+1, nullptr, 16)`, not `atoi()`
+- Error code is hexadecimal — use `strtoul(hexCode, nullptr, 16) != 0`
+- Line terminator: `\r\n` (not just `\n`)
+- ANT interlock starts in `ready` state — force send by setting `flexRadioInhibit = true` before calling `flexRadioSendInterlock(conflictActive)` after registration
+- `flexRadioSend()` is `static void` (file-scope helper, no forward declaration)
 
-### ssePushStatus() after interlock changes
+### FLEX radio selection priority
+1. AG Port 2 `source=FLEX nickname=X` → match `agPort2FlexNickname` against list
+2. `flexDefaultIP` from NVS (namespace `"flex"`, key `"defaultIP"`)
+3. `flexRadioCount == 1` → auto-select
+4. Multiple radios → `flexSelectPending = true` → web card + `MENU_FLEX_SELECT`
 
-`flexRadioSendInterlock()` calls `ssePushStatus()` after each send. `flexRadioLoop()` calls `ssePushStatus()` after successful connect. This ensures the web UI updates immediately.
-
-### Radio discovery and selection
-
-VITA-49 packets received on `flexListenUdp`. OUI check: `buf[8]==0x00 && buf[9]==0x1C && buf[10]==0x2D`. IP extracted from `ip=` field in ASCII payload (more reliable than UDP sender IP with NAT).
-
-**Auto-select priority:**
-1. AG Port 2 `source=FLEX nickname=X` → `agPort2FlexNickname` match
-2. `flexDefaultIP` from NVS
-3. `flexRadioCount == 1` → auto
-4. Multiple → `flexSelectPending = true` → web card + `MENU_FLEX_SELECT`
-
-**`agPort2FlexNickname` is declared globally** (not inside `#if FLEX_EMULATION_ENABLED`) because `parsePortLine()` uses it unconditionally. Do not move it inside the guard.
+### agPort2FlexNickname — CRITICAL placement
+Declared **globally** (not inside `#if FLEX_EMULATION_ENABLED`) because `parsePortLine()` uses it unconditionally. Do not move it inside the guard.
 
 ### First connection timing
+`flexRadioLastTry = FLEX_RADIO_RECONNECT_MS` at init → first connect attempt is immediate when IP becomes known.
 
-`flexRadioLastTry` is initialized to `FLEX_RADIO_RECONNECT_MS` so that `millis() - flexRadioLastTry` is already large at startup → first connection attempt is immediate after IP is known.
+---
+
+## buildStatusJson() — Single JSON Source
+
+Both `ssePushStatus()` and `handleApiJson()` call `buildStatusJson()`. `handleApiJson()` removes the trailing `}` and appends `bands[]` and `antennas[]`.
+
+**antA/antB fallback:**
+```cpp
+uint8_t ia = portTxAnt[0];
+if (ia == 0 && AG_RADIO_PORT == 1) ia = wantedAntId;  // inhibit=1 fallback
+```
+
+**civTx field:** `"civTx": true/false` from `civTransmitting` (Cmd 0x1C/0x00), separate from `txA`/`txB` which come from AG status.
 
 ---
 
 ## Logging
 
-All entries: `mm:ss.mmm [TAG] message`. Ring buffer 300 entries. Export via `GET /log`.
+Format: `mm:ss.mmm [TAG] message`. Ring buffer 300 entries. `GET /log` for download.
 
 | Prefix | Source |
 |---|---|
 | `[ETH]` | Ethernet events |
 | `[DISC]` | AG UDP discovery |
 | `[AG]` | AG TCP commands/responses |
-| `[CIV]` | CI-V frames |
-| `[CONF]` | setConflict() calls (includes conflictReason) |
+| `[CIV]` | CI-V frames (freq + TX status) |
+| `[CONF]` | setConflict() calls |
 | `[FLEX:N]` | FlexRadio server client N |
 | `[FLEX]` | FlexRadio server broadcast |
 | `[FRINT]` | FlexRadio client (SmartSDR interlock) |
-| `[DISP]` | Display/encoder events |
-| `[WEB]` | Web server events |
+| `[DISP]` | Display/encoder |
+| `[WEB]` | Web server |
 
----
-
-## Web Endpoints
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/` | GET | HTML dashboard with SSE |
-| `/api` | GET | Full JSON snapshot (buildStatusJson + bands + antennas) |
-| `/events` | GET | SSE stream |
-| `/log` | GET | Log file download |
-| `/flex-select` | POST | Select FLEX radio (`ip=x.x.x.x`) |
-| `/flex-default` | POST | Set + persist default FLEX radio |
+Enable `#define DEBUG_CONFLICT 1` for per-check conflict diagnostic logging.
 
 ---
 
@@ -276,16 +261,18 @@ All entries: `mm:ss.mmm [TAG] message`. Ring buffer 300 entries. Export via `GET
 
 | Variable | Type | Description |
 |---|---|---|
-| `wantedAntId` | `uint8_t` | Last antenna requested via `setAGPort()`. Never 0 while port is active. Falls back in `checkAndSignalConflict(0)` and `buildStatusJson()`. |
+| `wantedAntId` | `uint8_t` | Last antenna requested via `setAGPort()`. Fallback in `checkAndSignalConflict(0)` and `buildStatusJson()`. Cleared **after** `setConflict()` in `releaseAGPort()`. |
+| `civTransmitting` | `bool` | True when TRX is transmitting (Cmd 0x1C/0x00). Drives `portTx[]`, display TX/RX, web `civTx` field. |
 | `conflictActive` | `bool` | Current conflict state. Toggled only by `setConflict()`. |
-| `conflictReason` | `char[64]` | Human-readable reason string built by `setConflict(true,...)`. Cleared by `setConflict(false,...)`. Contains CI-V addr, freq, antenna name. |
+| `conflictReason` | `char[64]` | Built by `setConflict(true,...)`, cleared by `setConflict(false,...)`. Contains CI-V addr, freq, antenna name. |
 | `portTxAnt[2]` | `uint8_t[]` | txant from AG status. **May be 0 during inhibit=1**. Use `wantedAntId` as fallback. |
 | `portBand[2]` | `uint8_t[]` | AG Band-ID (1-based). Search `bands[i].id == portBand[x]` for name. |
 | `lastBandId` | `int8_t` | 0-based index into `bands[]` from `freqToBandId()`. Use `bands[lastBandId]` directly. |
-| `agPort2FlexNickname` | `char[32]` | FLEX radio nickname from AG Port 2 `source=FLEX`. Global scope (not in guard). |
-| `flexListenUdp` | `WiFiUDP` | Receive-only UDP socket, `begin(4992)`. Separate from `flexDiscUdp`. |
-| `flexDiscUdp` | `WiFiUDP` | Send-only UDP socket. No `begin()` call. |
+| `agPort2FlexNickname` | `char[32]` | FLEX radio nickname from AG Port 2 `source=FLEX`. **Global scope** (not in FLEX guard). |
+| `flexListenUdp` | `WiFiUDP` | Receive-only, `begin(4992)` in `flexSetup()`. |
+| `flexDiscUdp` | `WiFiUDP` | Send-only, **no `begin()`**. |
 | `flexRadioLastTry` | `uint32_t` | Init to `FLEX_RADIO_RECONNECT_MS` for immediate first connect. |
+| `effectiveTxant` | local `uint8_t` | In `parsePortLine()`: 0 when AG reports source=AUTO for own port and `wantedAntId==0`. |
 
 ---
 
@@ -294,19 +281,17 @@ All entries: `mm:ss.mmm [TAG] message`. Ring buffer 300 entries. Export via `GET
 | Symptom | Root cause | Fix |
 |---|---|---|
 | ETH reset timeout | `ETH_POWER_PIN` wrong | `16` or `-1` |
-| AG ignores all commands | `print()` + `\r` only | `write()` + `flush()` + `\r\n` |
-| All AG responses discarded | `agCfgSeq = agSeq` before send | `sendAGCfgCmd()` sets after |
-| `delay(200)` blocked loop | Blocking delay | `agConfigStartAt` timer |
+| AG ignores commands | `print()` + `\r` only | `write()` + `flush()` + `\r\n` |
+| All AG responses discarded | `agCfgSeq = agSeq` before send | `sendAGCfgCmd()` |
 | No `[FRINT]` entries | `flexDiscUdp.begin(4992)` blocked send | Separate `flexListenUdp` |
-| FLEX radio never discovered | `flexListenUdp` not bound | `flexSetup()` calls `begin(4992)` |
-| SmartSDR not inhibited | AG `inhibit=1` ignored by SmartSDR | Direct TCP client interlock |
-| Conflict not detected after sequence | `portTxAnt=0` during `inhibit=1` | `wantedAntId` fallback |
-| Conflict not cleared after other port changes band | `parsePortLine` only checked if `conflictActive` | Re-check on every other-port update |
-| Port A/B shows `---` in web UI during conflict | `portTxAnt=0` fed to `buildStatusJson` | `wantedAntId` fallback in antA/antB |
-| bandA/bandB wrong band name | `bands[portBand[0]]` (array index ≠ band ID) | Search by `bands[i].id == portBand[x]` |
-| FLEX/interlock status not updated in web UI | `ssePushStatus()` not called after connect/interlock change | Added after `flexRadioConnected=true` and in `flexRadioSendInterlock()` |
-| `handleApiJson` missing bandA/bandB | Fields not in old duplicate JSON block | `buildStatusJson()` shared function |
-| 20 s delay before first FLEX connect | `flexRadioLastTry=0`, condition `millis()-0 < 20000` | Init to `FLEX_RADIO_RECONNECT_MS` |
-| `agPort2FlexNickname` not declared | Inside `FLEX_EMULATION_ENABLED` guard | Moved to global scope |
-| `flexRadioListAge` write-only | Never read | Removed |
-| `flexSendLine()` (broadcast) dead code | No callers after refactor | Removed |
+| Interlock ID = -1 | `atoi()` on hex ID | `strtol(..., 16)` |
+| Conflict not resolved | `parsePortLine` only checked if `conflictActive` | Re-check on every other-port update |
+| False conflict at startup | AG returns last session state (source=AUTO) | `effectiveTxant = 0` guard |
+| Conflict persists after release | `portTxAnt` not reset in `releaseAGPort()` | Explicit reset to 0 |
+| antA/antB shows `---` | `portTxAnt=0` during inhibit | `wantedAntId` fallback |
+| bandA/bandB wrong name | `bands[portBand[0]]` off-by-one | Search by `bands[i].id == portBand[x]` |
+| Encoder not working | `GPIO.in` used for pins 32–39 | `GPIO.in1.val >> (PIN-32)` |
+| Encoder skips/doubles | Wrong pulses-per-detent | `ENC_PULSES_PER_DETENT` define |
+| SmartSDR antenna selectable in menu | `menuBuildAntList()` didn't filter other port | `blockedAnt = portTxAnt[otherIdx]` |
+| Display not updating | `dispNeedsRedraw` not set on CI-V events | Set on `civFreqMHz` and `civTransmitting` change |
+| TX status always RX | Cmd 0x1C not sent | `requestCIVTxStatus()` every 200 ms |

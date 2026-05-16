@@ -42,6 +42,8 @@
  *     TCP-Server sendet Interlock-Status proaktiv nach keepalive enable
  *  9. FlexRadio-Client: entdeckt FLEX-Radios via VITA-49 UDP-Broadcast,
  *     wählt automatisch das AG-verbundene Radio, registriert ANT-Interlock
+ * 10. TX-Status (Cmd 0x1C/0x00) alle 200 ms abfragen → civTransmitting,
+ *     portTx[], Web-UI Badge und Display TX/RX-Indikator
  *
  * Sicherheitsfunktionen (alle über setConflict() synchron):
  *  - GPIO4 HIGH:        TX-Inhibit-Hardwareleitung zum TRX
@@ -49,6 +51,13 @@
  *  - FlexRadio Server:  state=PTT_REQUESTED → AG sperrt Port B
  *  - FlexRadio Client:  interlock not_ready → SmartSDR TX-Inhibit direkt
  *  setConflict() befüllt conflictReason (Anzeige im Web-UI)
+ *
+ * Display-Menüstruktur:
+ *  MENU_STATUS     Normalanzeige (Frequenz, Band, Antenne, TX/RX)
+ *  MENU_INFO       Info-Seite: IP, CI-V, AG, FLEX (langer Tastendruck ≥1s)
+ *  MENU_ANT_SELECT Antennen-Auswahl (kurzer Tastendruck; zeigt nur freie Ant.)
+ *  MENU_CONFIRM    Bestätigungsdialog
+ *  MENU_FLEX_SELECT FLEX-Radio Auswahl (erscheint automatisch)
  *
  * Konflikt-Erkennung:
  *  wantedAntId merkt sich die zuletzt angeforderte Antenne unabhängig vom
@@ -65,7 +74,7 @@
  *  - AG sendet kein sub tx — Status proaktiv nach keepalive enable senden
  *
  * SmartSDR Ethernet-Interlock:
- *  - type=ANT Interlock via "interlock create type=ANT name=... serial=..."
+ *  - type=ANT Interlock via "interlock create type=ANT model=... serial=..."
  *  - Sperren:    "interlock not_ready <id>"
  *  - Freigeben:  "interlock ready <id>"
  *  - IP-Discovery: flexListenUdp (Port 4992, getrennt von flexDiscUdp)
@@ -81,6 +90,7 @@
  *  FLEX_EMULATION_ENABLED 1/0   FlexRadio-Emulation aktivieren
  *  CIV_BAUD               19200 Baudrate CI-V
  *  CIV_BROADCAST_TIMEOUT_MS 1000 Nach 1 s ohne Broadcast aktiv pollen
+ *  DEBUG_CONFLICT          0/1   TX-Konflikt-Debugging aktivieren
  *  CIV_TIMEOUT_MS         5000  Inaktivitäts-Timeout TRX → Port freigeben
  *  AG_RADIO_PORT          1     Genutzter AG-Port (1=A, 2=B)
  *  ETH_POWER_PIN          16    LAN8720 Reset (-1 auf manchen Boards)
@@ -88,7 +98,7 @@
  *  FLEX_INTERLOCK_NAME    ...   ANT-Interlock-Name in SmartSDR
  *  FLEX_INTERLOCK_SERIAL  ...   Seriennummer des Interlocks
  *  FLEX_MAX_RADIOS        8     Max. gespeicherte FLEX-Radios
- *  DISP_CONTRAST          22    Display-Kontrast 0-63
+ *  DISP_CONTRAST          45    Display-Kontrast 0-63
  *
  * Bibliotheken (Board: esp32 by Espressif ≥ 2.x):
  *  - ETH.h, WiFiUdp.h, WiFiClient.h, WiFiServer.h,
@@ -143,6 +153,7 @@
 
 // ─── Konflikt-Ausgang ────────────────────────────────────────────────────────
 #define CONFLICT_PIN    4
+#define DEBUG_CONFLICT  0   // 1 = checkAndSignalConflict logt jeden Check (Debugging)
 
 // ─── Display (EA DOGL128W-6, ST7565, Software-SPI) ──────────────────────────
 // Alle Pins sind am WT32-ETH01 frei verfügbar.
@@ -160,9 +171,11 @@
 #define ENC_BTN_PIN     35   // Encoder Taster   (input-only, ext. Pull-up)
 // Hinweis: GPIO35/36/39 sind input-only ohne internen Pull-up.
 // Externe Pull-up-Widerstände (10 kΩ) an 3.3 V sind zwingend erforderlich!
-// GPIO36/39 haben 270 pF interne Kapazität → Encoder-B wird per Polling gelesen
-// (kein ISR auf GPIO36) um möglichen Crosstalk zu vermeiden.
+// GPIO36/39 haben 270 pF interne Kapazität.
+// Beide Kanaele werden per ISR ausgewertet (CHANGE auf A und B).
+// Vollstaendiges 4-Zustand-Gray-Code-Decoding verhindert Fehlzaehlungen.
 #define ENC_DEBOUNCE_MS  5   // Entprellzeit Taster in ms
+#define ENC_PULSES_PER_DETENT 4  // Impulse pro Rastschritt (typisch 4; bei Fehlzaehlung 2 oder 1 versuchen)
 #define MENU_TIMEOUT_MS 10000 // Menü schließt sich nach 10 s Inaktivität
 
 // ─── Web-Server ──────────────────────────────────────────────────────────────
@@ -196,6 +209,7 @@
 #define FLEX_INTERLOCK_SERIAL "DK4DJ-1"
 #define FLEX_RADIO_RECONNECT_MS 20000  // Wiederverbindungsversuch alle 20 s
 #define FLEX_MAX_RADIOS    8           // max. gleichzeitig gespeicherte FLEX-Radios
+#define FLEX_MAX_CLIENTS   4           // max. gleichzeitige TCP-Clients am FlexRadio-Server
 
 // ─── CI-V Konstanten ────────────────────────────────────────────────────────
 #define CIV_PREAMBLE    0xFE
@@ -287,7 +301,9 @@ static uint8_t  civLen        = 0;
 static uint8_t  civAddr       = 0x00;
 static int8_t   lastBandId    = -1;
 static uint32_t lastCivRx     = 0;   // Zeitstempel letzter CI-V Frequenzempfang
-static uint32_t lastCivPoll   = 0;   // Zeitstempel letztes aktives Polling
+static uint32_t lastCivPoll   = 0;   // Zeitstempel letztes Frequenz-Polling
+static uint32_t lastTxPoll    = 0;   // Zeitstempel letztes TX-Status-Polling
+static bool     civTransmitting = false; // true = TRX sendet gerade (Cmd 0x1C 0x00)
 static double   civFreqMHz    = 0.0;
 static bool     civPortReleased = false; // true wenn Port nach Timeout freigegeben wurde
 
@@ -304,7 +320,6 @@ static bool       sseConnected = false;
 static WiFiServer  flexTcpServer(FLEX_TCP_PORT);
 // FlexRadio TCP-Server: bis zu FLEX_MAX_CLIENTS Clients gleichzeitig
 // (typisch: AG auf Port 4992 + SmartSDR auf Port 4992)
-#define FLEX_MAX_CLIENTS 4
 struct FlexClient {
   WiFiClient  tcp;
   bool        connected  = false;
@@ -373,9 +388,9 @@ static uint32_t agUptime     = 0;    // Sekunden seit letztem Boot
 #if DISPLAY_ENABLED
 
 // U8g2: Software-SPI, Single-Page-Rendering (128 Byte RAM statt 1 KB)
-// Rotation U8G2_R2 = 180° (je nach Einbaulage anpassen: R0/R1/R2/R3)
+// Rotation U8G2_R0 = 0° (je nach Einbaulage anpassen: R0/R1/R2/R3)
 U8G2_ST7565_EA_DOGM128_1_4W_SW_SPI u8g2(
-  U8G2_R2,
+  U8G2_R0,
   DISP_SCK_PIN, DISP_MOSI_PIN,
   DISP_CS_PIN,  DISP_A0_PIN,
   DISP_RST_PIN
@@ -453,11 +468,12 @@ static const uint8_t splashBitmap[] PROGMEM = {
 #define SPLASH_H  64
 
 // Display-Kontrast 0–63 (typisch 20–30 für DOGL128 mit 3.3 V)
-#define DISP_CONTRAST   22
+#define DISP_CONTRAST   45
 
 // Menü-Zustände
 enum MenuState {
   MENU_STATUS,       // Normalanzeige: Frequenz / Band / Antenne
+  MENU_INFO,         // Info-Seite: IP, CI-V, AG, FLEX-Radio
   MENU_ANT_SELECT,   // Antennen-Auswahl für aktuelles Band
   MENU_CONFIRM,      // Bestätigungsdialog Antenne
   MENU_FLEX_SELECT   // FLEX-Radio-Auswahl (mehrere Radios gefunden)
@@ -471,25 +487,32 @@ static uint32_t     menuLastAction = 0;  // letzter Encoder-/Tasterdruck (ms)
 static bool         dispNeedsRedraw = true;
 
 // Encoder-State (ISR-sicher)
-static volatile int8_t  encDelta   = 0;  // akkumulierte Schritte seit letztem Loop
+// encDelta: akkumulierte Rohpulse seit letztem Loop-Aufruf.
+// Beide Kanaele (A+B) loesen ISR aus → alle 4 Zustandsuebergaenge pro Raste erfasst.
+// Vollstaendige 4-Bit-State-Machine verhindert Fehlzaehlungen durch Crosstalk/Prellen.
+static volatile int8_t  encDelta   = 0;
 static uint32_t         encBtnTime = 0;
 
-// ISR für Encoder Kanal A (im Loop ausgewertet wegen SPI-Konflikte)
-// Einfaches Gray-Code-Decoding
+// ISR: beide Kanaele A und B loesen CHANGE-Interrupt aus.
+// State = (letztes_A << 3) | (letztes_B << 2) | (aktuelles_A << 1) | aktuelles_B
+// Nur gueltige Gray-Code-Uebergaenge werden gezaehlt (ungueltige → 0).
 static void IRAM_ATTR encISR() {
-  static uint8_t last = 0;
-  uint8_t a = digitalRead(ENC_A_PIN);
-  uint8_t b = digitalRead(ENC_B_PIN);
-  uint8_t cur = (a << 1) | b;
-  // Gray-Code Tabelle: +1 oder -1 je nach Übergang
+  static uint8_t state = 0;
+  // GPIO 32-39 liegen im Register GPIO.in1.val (nicht GPIO.in das nur GPIO 0-31 abdeckt).
+  // Direktzugriff: Bit = (PIN - 32) in GPIO.in1.val
+  uint8_t a = (GPIO.in1.val >> (ENC_A_PIN - 32)) & 1;
+  uint8_t b = (GPIO.in1.val >> (ENC_B_PIN - 32)) & 1;
+  state = ((state << 2) | (a << 1) | b) & 0x0F;
+  // Nur die vier gueltigen Gray-Code-Vorwaerts- und Rueckwaertsuebergaenge zaehlen
+  // Vorwaerts:  00→01  01→11  11→10  10→00  (state: 1,7,14,8)
+  // Rueckwaerts:00→10  10→11  11→01  01→00  (state: 2,4,13,11)
   static const int8_t table[16] = {
-     0, -1,  1,  0,
-     1,  0,  0, -1,
-    -1,  0,  0,  1,
-     0,  1, -1,  0
+    0, +1, -1, 0,   // state 0..3
+   -1,  0,  0, +1,  // state 4..7
+   +1,  0,  0, -1,  // state 8..11
+    0, -1, +1, 0    // state 12..15
   };
-  encDelta += table[(last << 2) | cur];
-  last = cur;
+  encDelta += table[state];
 }
 
 #endif // DISPLAY_ENABLED
@@ -517,6 +540,7 @@ void sendKeepalive();
 void handleCIV();
 void processCIVFrame();
 void requestCIVFreq();
+void requestCIVTxStatus();
 uint64_t decodeCIVFreq(const uint8_t *data);
 int8_t freqToBandId(double freqMHz);
 uint8_t selectAntenna(uint8_t bandId);
@@ -551,6 +575,7 @@ void handleFlexSetDefault();
 void displaySetup();
 void displayLoop();
 void displayDrawStatus();
+void displayDrawInfo();
 void displayDrawAntMenu();
 void displayDrawConfirm();
 void displayDrawFlexSelect();
@@ -648,8 +673,10 @@ String buildStatusJson() {
   json += "\"portB\":\"" + antB + "\",";
   json += "\"bandA\":\"" + bandA + "\",";
   json += "\"bandB\":\"" + bandB + "\",";
+  // portTx[AG_RADIO_PORT-1] wird durch Cmd 0x1C 0x00 aktualisiert.
   json += "\"txA\":" + String(portTx[0] ? "true" : "false") + ",";
   json += "\"txB\":" + String(portTx[1] ? "true" : "false") + ",";
+  json += "\"civTx\":" + String(civTransmitting ? "true" : "false") + ",";
   json += "\"conflict\":" + String(conflictActive ? "true" : "false") + ",";
   json += "\"conflictReason\":\"" + String(conflictReason) + "\",";
   json += "\"civReleased\":" + String(civPortReleased ? "true" : "false") + ",";
@@ -1277,10 +1304,21 @@ void parsePortLine(const String &s) {
   if (bp) sscanf(bp + 5, "%hhu", &band);
   if (xp) sscanf(xp + 4, "%hhu", &tx);
 
-  bool changed = (portTxAnt[idx] != txant || portRxAnt[idx] != rxant ||
-                  portBand[idx]  != band  || portTx[idx]    != (bool)tx);
+  // source=AUTO-Guard: Wenn der AG für unseren eigenen Port source=AUTO meldet
+  // und wir noch keine Antenne angefordert haben (wantedAntId=0), den txant-Wert
+  // auf 0 setzen. Verhindert dass der letzte Sitzungszustand nach Neustart oder
+  // CIV-Timeout fälschlicherweise als aktuell interpretiert wird.
+  uint8_t effectiveTxant = txant;
+  if ((uint8_t)portId == AG_RADIO_PORT && wantedAntId == 0) {
+    char *srcp = strstr(s.c_str(), "source=AUTO");
+    if (srcp) effectiveTxant = 0;
+  }
+
+  bool changed = (portTxAnt[idx] != effectiveTxant || portRxAnt[idx] != rxant ||
+                  portBand[idx]  != band            || portTx[idx]    != (bool)tx);
   const uint8_t otherPort = (AG_RADIO_PORT == 1) ? 2 : 1;
   if (changed) {
+    txant = effectiveTxant;  // tatsächlich zu speichernder Wert
     webLog("[AG] Port %d: band=%d txant=%d rxant=%d tx=%d",
            portId, band, txant, rxant, tx);
     portTxAnt[idx] = txant;
@@ -1289,10 +1327,10 @@ void parsePortLine(const String &s) {
     portTx[idx]    = (bool)tx;
 
     // Wenn der *andere* Port seine Antenne geändert hat, Konflikt neu bewerten.
-    // 0 übergeben → checkAndSignalConflict benutzt wantedAntId (letzte angeforderte
-    // Antenne), nicht portTxAnt[AG_RADIO_PORT-1] das bei inhibit=1 auf 0 steht.
-    if (portId == otherPort) {
-      checkAndSignalConflict(0);
+    // Nur wenn unser eigener Port aktiv konfiguriert ist (wantedAntId > 0).
+    // wantedAntId=0 bedeutet kein aktiver CI-V-Betrieb → kein Konflikt möglich.
+    if (portId == otherPort && wantedAntId > 0) {
+      checkAndSignalConflict(wantedAntId);
     }
   }
 
@@ -1319,6 +1357,7 @@ void parsePortLine(const String &s) {
 //  AG Port schalten
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ─── AG-Port konfigurieren und lokalen Zustand aktualisieren ──────────────
 void setAGPort(uint8_t portId, uint8_t bandId, uint8_t antId) {
   if (!agConnected) return;
   char cmd[64];
@@ -1347,10 +1386,23 @@ void setAGPort(uint8_t portId, uint8_t bandId, uint8_t antId) {
 void releaseAGPort() {
   webLog("[CIV] Timeout: TRX nicht mehr aktiv – gebe Port %d frei", AG_RADIO_PORT);
 
-  lastBandId   = -1;
-  civFreqMHz   = 0.0;
-  wantedAntId  = 0;
+  lastBandId       = -1;
+  civFreqMHz       = 0.0;
+  civTransmitting  = false;          // TX-Status zurücksetzen
+  portTx[AG_RADIO_PORT - 1] = false; // AG-Port TX zurücksetzen
+#if DISPLAY_ENABLED
+  if (menuState == MENU_STATUS) dispNeedsRedraw = true;
+#endif
   snprintf(civFreqStr, sizeof(civFreqStr), "---");
+
+  // Lokalen Port-Zustand explizit zurücksetzen.
+  // Der AG antwortet auf port set band=0 txant=0 oft mit dem zuletzt gespeicherten
+  // Zustand (z.B. band=7 txant=1) → changed=false → parsePortLine tut nichts.
+  // Ohne dieses Reset würde portTxAnt[0] den alten Wert behalten.
+  portTxAnt[AG_RADIO_PORT - 1] = 0;
+  portRxAnt[AG_RADIO_PORT - 1] = 0;
+  portBand[AG_RADIO_PORT - 1]  = 0;
+  portTx[AG_RADIO_PORT - 1]    = false;
 
   // Port auf Nullzustand setzen: kein Band, keine Antenne
   if (agConnected) {
@@ -1363,8 +1415,9 @@ void releaseAGPort() {
   }
 
   // GPIO4 HIGH + CI-V TX Inhibit als Sicherheitssperre
-  // setConflict() ruft intern ssePushStatus() auf — kein weiterer Aufruf nötig
+  // setConflict VOR wantedAntId=0 damit conflictReason die letzte Antenne zeigt
   setConflict(true, "TRX Timeout");
+  wantedAntId  = 0;   // nach setConflict() damit conflictReason korrekt befüllt wird
 }
 
 // ─── CI-V TX Inhibit senden (Cmd 0x16, Subcmd 0x66) ──────────────────────
@@ -1451,25 +1504,33 @@ void checkAndSignalConflict(uint8_t wantedAnt) {
 
   uint8_t otherIdx   = (AG_RADIO_PORT == 1) ? 1 : 0;
   uint8_t otherTxAnt = portTxAnt[otherIdx];
-  bool conflict = (wantedAnt != 0) && (otherTxAnt == wantedAnt);
+  // Konflikt: gleiche Antenne konfiguriert UND der andere Port hat eine gültige Antenne (!=0).
+  // txant=0 bedeutet der andere Port ist freigegeben/inaktiv → kein Konflikt.
+  bool conflict = (wantedAnt != 0) && (otherTxAnt != 0) && (otherTxAnt == wantedAnt);
+#if DEBUG_CONFLICT
+  webLog("[CONF] Check: wantedAnt=%d otherTxAnt=%d portTxAnt=[%d,%d] wantedAntId=%d → %s",
+         wantedAnt, otherTxAnt, portTxAnt[0], portTxAnt[1], wantedAntId,
+         conflict ? "KONFLIKT" : (conflictActive ? "aufloesen" : "ok"));
+#endif
   if (conflict)
     setConflict(true,  "Antenne von anderem Port belegt");
   else if (conflictActive)
     setConflict(false, "Konflikt aufgeloest");
 }
 
+// ─── Beste Antenne für Band-Index wählen (TX-Maske) ───────────────────────
 uint8_t selectAntenna(uint8_t bandId) {
   uint16_t bandBit = (1u << bandId);
   for (uint8_t i = 0; i < MAX_ANTENNAS; i++) {
     if (!antennas[i].valid) continue;
     if (antennas[i].txMask & bandBit) return antennas[i].id;
   }
-  for (uint8_t i = 0; i < MAX_ANTENNAS; i++) {
-    if (antennas[i].valid) return antennas[i].id;
-  }
+  // Kein Fallback auf erste Antenne — 0 bedeutet "keine passende Antenne"
+  // damit handleCIV() keinen Port-Switch auf eine unpassende Antenne auslöst.
   return 0;
 }
 
+// ─── Frequenz → Band-Index (0-basiert in bands[]) ─────────────────────────
 int8_t freqToBandId(double freqMHz) {
   for (uint8_t i = 1; i < MAX_BANDS; i++) {
     if (!bands[i].valid || bands[i].freqStop <= 0) continue;
@@ -1512,7 +1573,7 @@ void handleCIV() {
     return;
   }
 
-  // Aktives Polling wenn seit CIV_BROADCAST_TIMEOUT_MS kein Broadcast —
+  // Aktives Frequenz-Polling wenn seit CIV_BROADCAST_TIMEOUT_MS kein Broadcast —
   // aber nur solange der Port NICHT bereits wegen Timeout freigegeben wurde
   if (!civPortReleased &&
       civAddr != 0x00 &&
@@ -1521,9 +1582,17 @@ void handleCIV() {
     lastCivPoll = millis();
     requestCIVFreq();
   }
+
+  // TX-Status regelmäßig abfragen (Cmd 0x1C 0x00) sobald TRX-Adresse bekannt.
+  // Intervall: alle 200 ms — schnell genug für sichtbaren TX-Indikator.
+  if (civAddr != 0x00 && !civPortReleased &&
+      millis() - lastTxPoll > 200) {
+    lastTxPoll = millis();
+    requestCIVTxStatus();
+  }
 }
 
-// CI-V Frequenzabfrage aktiv senden (Cmd 0x03 an Transceiver)
+// ─── CI-V Frequenzabfrage (Cmd 0x03) ─────────────────────────────────────
 void requestCIVFreq() {
   // FE FE <dst> <src> 03 FD
   uint8_t frame[6] = {
@@ -1534,6 +1603,18 @@ void requestCIVFreq() {
   Serial2.write(frame, sizeof(frame));
 }
 
+// ─── CI-V TX-Status abfragen (Cmd 0x1C 0x00) ─────────────────────────────
+// Antwort: FE FE E0 <src> 1C 00 <00=RX / 01=TX> FD
+void requestCIVTxStatus() {
+  uint8_t frame[7] = {
+    CIV_PREAMBLE, CIV_PREAMBLE,
+    civAddr, CIV_CONTROLLER,
+    0x1C, 0x00, CIV_EOM
+  };
+  Serial2.write(frame, sizeof(frame));
+}
+
+// ─── Empfangenen CI-V Frame verarbeiten ───────────────────────────────────
 void processCIVFrame() {
   if (civLen < 6) return;
   if (civBuf[0] != CIV_PREAMBLE || civBuf[1] != CIV_PREAMBLE) return;
@@ -1551,11 +1632,29 @@ void processCIVFrame() {
     ssePushStatus();
   }
 
-  // Nur Frequenz-Frames verarbeiten (Cmd 0x00 = Broadcast, 0x03 = Poll-Antwort)
-  if (cmd != 0x00 && cmd != 0x03) return;
-
   // Nur Frames die an uns oder Broadcast gerichtet sind
   if (dst != CIV_CONTROLLER && dst != 0x00) return;
+
+  // ── Cmd 0x1C: TX-Status-Antwort ──────────────────────────────────────────
+  // Frame: FE FE E0 <src> 1C 00 <status> FD
+  //   status: 0x00 = RX, 0x01 = TX
+  if (cmd == 0x1C && civLen >= 8 && civBuf[5] == 0x00) {
+    bool txNow = (civBuf[6] == 0x01);
+    if (txNow != civTransmitting) {
+      civTransmitting = txNow;
+      webLog("[CIV] TX-Status: %s", txNow ? "TX" : "RX");
+      // portTx für den eigenen Port aktualisieren
+      portTx[AG_RADIO_PORT - 1] = txNow;
+#if DISPLAY_ENABLED
+      if (menuState == MENU_STATUS) dispNeedsRedraw = true;
+#endif
+      ssePushStatus();
+    }
+    return;
+  }
+
+  // ── Frequenz-Frames (Cmd 0x00 = Broadcast, 0x03 = Poll-Antwort) ──────────
+  if (cmd != 0x00 && cmd != 0x03) return;
 
   // Mindestens 5 Frequenz-Bytes nötig
   if (civLen < 11) return;
@@ -1574,6 +1673,10 @@ void processCIVFrame() {
   }
   snprintf(civFreqStr, sizeof(civFreqStr), "%.6f MHz", freqMHz);
   civFreqMHz = freqMHz;
+#if DISPLAY_ENABLED
+  // Frequenzanzeige bei jeder Änderung aktualisieren (nur im Statusscreen)
+  if (menuState == MENU_STATUS) dispNeedsRedraw = true;
+#endif
 
   // Band bestimmen
   int8_t bandId = freqToBandId(freqMHz);
@@ -1613,6 +1716,7 @@ void processCIVFrame() {
   ssePushStatus();
 }
 
+// ─── BCD-kodierte CI-V Frequenz dekodieren ────────────────────────────────
 uint64_t decodeCIVFreq(const uint8_t *data) {
   uint64_t freq = 0, mult = 1;
   for (int i = 0; i < 5; i++) {
@@ -1809,6 +1913,7 @@ void handleWebRoot() {
     <h2>Port-Belegung</h2>
     <div class="kv"><span class="label">Port A &ndash; Antenne</span><span id="portA"><span class="badge badge-muted">---</span></span></div>
     <div class="kv"><span class="label">Port A &ndash; Band</span><span id="bandA"><span class="badge badge-muted">---</span></span></div>
+    <div class="kv"><span class="label">Funkger&auml;t TX</span><span id="civTxWrap"><span class="badge badge-muted">---</span></span></div>
     <div class="kv"><span class="label">Port A &ndash; TX</span><span id="txA"><span class="badge badge-muted">---</span></span></div>
     <div class="kv"><span class="label">Port B &ndash; Antenne</span><span id="portB"><span class="badge badge-muted">---</span></span></div>
     <div class="kv"><span class="label">Port B &ndash; Band</span><span id="bandB"><span class="badge badge-muted">---</span></span></div>
@@ -1892,6 +1997,17 @@ function applyStatus(d){
   document.getElementById('civFreq').textContent=d.civFreq;
   const ab=document.getElementById('activeBand');
   ab.innerHTML=d.activeBand!=='---'?`<span class="badge badge-blue">${esc(d.activeBand)}</span>`:`<span class="badge badge-muted">---</span>`;
+  // Funkgerät TX-Status (Cmd 0x1C 0x00)
+  const civTxw=document.getElementById('civTxWrap');
+  if(civTxw){
+    if(d.civTx)
+      civTxw.innerHTML='<span class="badge badge-tx">&#128308; TX</span>';
+    else if(d.civAddr&&d.civAddr!='---')
+      civTxw.innerHTML='<span class="badge badge-green">RX</span>';
+    else
+      civTxw.innerHTML='<span class="badge badge-muted">---</span>';
+  }
+
   // TRX-Status (civReleased = Port wurde wegen Timeout freigegeben)
   const crw=document.getElementById('civReleasedWrap');
   if(crw){
@@ -2078,9 +2194,10 @@ void displaySetup() {
   pinMode(ENC_B_PIN,   INPUT);   // ext. Pull-up erforderlich
   pinMode(ENC_BTN_PIN, INPUT);   // ext. Pull-up erforderlich
 
-  // ISR auf beide Flanken von Kanal A (GPIO39)
-  // Kanal B (GPIO36) wird per Polling gelesen um 36/39-Crosstalk zu vermeiden
+  // ISR auf beide Flanken beider Kanaele A (GPIO39) und B (GPIO36).
+  // Die 4-Bit-State-Machine in encISR() filtert Glitches durch Crosstalk automatisch.
   attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), encISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), encISR, CHANGE);
 
   // Display initialisieren
   u8g2.begin();
@@ -2112,6 +2229,7 @@ void displayLoop() {
 
   switch (menuState) {
     case MENU_STATUS:      displayDrawStatus();     break;
+    case MENU_INFO:        displayDrawInfo();       break;
     case MENU_ANT_SELECT:  displayDrawAntMenu();    break;
     case MENU_CONFIRM:     displayDrawConfirm();    break;
     case MENU_FLEX_SELECT: displayDrawFlexSelect(); break;
@@ -2136,15 +2254,30 @@ void displayDrawStatus() {
     // ── Zeile 1: Frequenz ──
     u8g2.setFont(u8g2_font_7x14B_tf);
     if (civFreqMHz > 0.001) {
-      // Format: 14.225.000 MHz
+      // Format: 14.225 MHz (kompakt um Platz für TX/RX zu lassen)
       uint32_t kHz = (uint32_t)(civFreqMHz * 1000.0 + 0.5);
       uint16_t mhz  = kHz / 1000;
       uint16_t frac = kHz % 1000;
-      snprintf(buf, sizeof(buf), "%u.%03u MHz", mhz, frac);
+      snprintf(buf, sizeof(buf), "%u.%03u", mhz, frac);
     } else {
-      strcpy(buf, "--- MHz");
+      strcpy(buf, "---");
     }
     u8g2.drawStr(0, 13, buf);
+
+    // TX/RX-Indikator am rechten Rand der Frequenzzeile
+    if (civAddr != 0x00) {
+      u8g2.setFont(u8g2_font_6x10_tf);
+      if (civTransmitting) {
+        // TX: invertierter Block für maximale Sichtbarkeit
+        u8g2.drawBox(107, 3, 20, 11);
+        u8g2.setDrawColor(0);
+        u8g2.drawStr(109, 13, "TX");
+        u8g2.setDrawColor(1);
+      } else {
+        u8g2.drawStr(109, 13, "RX");
+      }
+    }
+    u8g2.setFont(u8g2_font_7x14B_tf); // Font für nachfolgende Zeilen
 
     u8g2.setFont(u8g2_font_6x10_tf);
 
@@ -2192,6 +2325,80 @@ void displayDrawStatus() {
       snprintf(buf, sizeof(buf), "IP: %s", agIPStr[0] ? agIPStr : "...");
       u8g2.drawStr(0, 62, buf);
     }
+
+  } while (u8g2.nextPage());
+}
+
+// ─── Info-Seite ────────────────────────────────────────────────────────────
+//
+// ┌────────────────────────────────┐
+// │ WT32: 192.168.1.202            │
+// │ AG:   192.168.1.221  FW:4.1.8  │
+// │ FLEX: 192.168.1.100 (Flexi)    │
+// │────────────────────────────────│
+// │ CI-V: 0x94   19200 Baud        │
+// │ [Taste] = zurück               │
+// └────────────────────────────────┘
+//
+// Erreichbar: langer Tastendruck (≥ 1 s) aus der Statusanzeige.
+
+void displayDrawInfo() {
+  char buf[24];
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_5x7_tf);
+
+    // ── Zeile 1: WT32-IP ──
+    snprintf(buf, sizeof(buf), "WT32: %s",
+             ETH.localIP().toString().c_str());
+    u8g2.drawStr(0, 8, buf);
+
+    // ── Zeile 2: AG-IP und Firmware ──
+    if (agIPStr[0] && agIPStr[0] != '-') {
+      char fwshort[8] = "";
+      strncpy(fwshort, agFwStr, 7);
+      snprintf(buf, sizeof(buf), "AG:   %s", agIPStr);
+      u8g2.drawStr(0, 17, buf);
+      snprintf(buf, sizeof(buf), "FW:%s S/N:%s", fwshort, agSerialStr);
+      u8g2.drawStr(0, 26, buf);
+    } else {
+      u8g2.drawStr(0, 17, "AG:   ---");
+      u8g2.drawStr(0, 26, "");
+    }
+
+    // ── Zeile 3: FLEX-Radio ──
+#if FLEX_EMULATION_ENABLED
+    if (flexRadioIPKnown && flexSelectedIdx >= 0 &&
+        flexSelectedIdx < FLEX_MAX_RADIOS &&
+        flexRadioList[flexSelectedIdx].valid) {
+      char nick[10] = "";
+      strncpy(nick, flexRadioList[flexSelectedIdx].nickname, 9);
+      snprintf(buf, sizeof(buf), "FLEX: %s",
+               flexRadioList[flexSelectedIdx].ip.toString().c_str());
+      u8g2.drawStr(0, 35, buf);
+      snprintf(buf, sizeof(buf), "      (%s)", nick);
+      u8g2.drawStr(0, 44, buf);
+    } else {
+      u8g2.drawStr(0, 35, "FLEX: ---");
+      u8g2.drawStr(0, 44, "");
+    }
+#else
+    u8g2.drawStr(0, 35, "FLEX: deaktiviert");
+#endif
+
+    // ── Trennlinie ──
+    u8g2.drawHLine(0, 47, 128);
+
+    // ── Zeile 4: CI-V Adresse und Baudrate ──
+    if (civAddr != 0x00)
+      snprintf(buf, sizeof(buf), "CI-V: 0x%02X  %lu Bd", civAddr, (unsigned long)CIV_BAUD);
+    else
+      snprintf(buf, sizeof(buf), "CI-V: ---   %lu Bd", (unsigned long)CIV_BAUD);
+    u8g2.drawStr(0, 56, buf);
+
+    // ── Fußzeile ──
+    u8g2.drawStr(0, 63, "[Taste]=zuruck");
 
   } while (u8g2.nextPage());
 }
@@ -2370,12 +2577,26 @@ void displayDrawFlexSelect() {
 #endif
 }
 
+// ─── Antennen-Liste für Menü aufbauen ────────────────────────────────────
+// Filtert heraus:
+//  - activeAnt:  die am eigenen Port bereits aktive Antenne
+//  - blockedAnt: die von SmartSDR (anderem Port) belegte Antenne
 void menuBuildAntList() {
   menuAntCount = 0;
+  uint8_t activeAnt  = currentAntId();           // eigene aktive Antenne ausschliessen
+  uint8_t otherIdx   = (AG_RADIO_PORT == 1) ? 1 : 0;
+  uint8_t blockedAnt = portTxAnt[otherIdx];      // von SmartSDR belegte Antenne ausschliessen
+
+  // Hilfslambda als Makro: gibt true zurück wenn Antenne nicht wählbar ist
+  // (eigene aktive ODER von SmartSDR belegt)
+  #define ANT_BLOCKED(aid) ((aid) == activeAnt || ((aid) == blockedAnt && blockedAnt != 0))
+
   if (lastBandId < 0) {
-    // Kein Band → alle gültigen Antennen anzeigen
+    // Kein Band → alle verfügbaren Antennen anzeigen
     for (uint8_t i = 0; i < MAX_ANTENNAS; i++) {
-      if (antennas[i].valid && menuAntCount < MAX_ANTENNAS)
+      if (!antennas[i].valid) continue;
+      if (ANT_BLOCKED(antennas[i].id)) continue;
+      if (menuAntCount < MAX_ANTENNAS)
         menuAntIds[menuAntCount++] = antennas[i].id;
     }
     return;
@@ -2383,17 +2604,22 @@ void menuBuildAntList() {
   uint16_t bandBit = (1u << lastBandId);
   for (uint8_t i = 0; i < MAX_ANTENNAS; i++) {
     if (!antennas[i].valid) continue;
+    if (ANT_BLOCKED(antennas[i].id)) continue;
     if (antennas[i].txMask & bandBit) {
       menuAntIds[menuAntCount++] = antennas[i].id;
     }
   }
-  // Fallback: wenn keine Antenne für das Band konfiguriert, alle zeigen
+  // Fallback: wenn keine freie Antenne für dieses Band verfügbar
   if (menuAntCount == 0) {
     for (uint8_t i = 0; i < MAX_ANTENNAS; i++) {
-      if (antennas[i].valid && menuAntCount < MAX_ANTENNAS)
+      if (!antennas[i].valid) continue;
+      if (ANT_BLOCKED(antennas[i].id)) continue;
+      if (menuAntCount < MAX_ANTENNAS)
         menuAntIds[menuAntCount++] = antennas[i].id;
     }
   }
+
+  #undef ANT_BLOCKED
 }
 
 // ─── Antenne tatsächlich schalten ─────────────────────────────────────────
@@ -2421,8 +2647,10 @@ void menuHandleEncoder() {
 
   static int8_t accumulator = 0;
   accumulator += delta;
-  int8_t steps = accumulator / 2;
-  accumulator %= 2;
+  // ENC_PULSES_PER_DETENT: Rohpulse pro Rastschritt (typisch 4 bei Standardencodern).
+  // Bei zu schnellem Ueberspringen: Wert verringern. Bei Doppelschritten: erhoehen.
+  int8_t steps = accumulator / ENC_PULSES_PER_DETENT;
+  accumulator %= ENC_PULSES_PER_DETENT;
 
   if (steps != 0) {
     menuLastAction  = millis();
@@ -2483,12 +2711,23 @@ void menuHandleEncoder() {
 
       switch (menuState) {
         case MENU_STATUS:
-          menuBuildAntList();
-          menuCursor = 0;
-          for (uint8_t i = 0; i < menuAntCount; i++) {
-            if (menuAntIds[i] == currentAntId()) { menuCursor = i; break; }
+          if (pressDuration >= 1000) {
+            // Langer Druck (≥ 1 s) → Info-Seite
+            menuState = MENU_INFO;
+          } else {
+            // Kurzer Druck → Antennen-Auswahl
+            menuBuildAntList();
+            menuCursor = 0;
+            for (uint8_t i = 0; i < menuAntCount; i++) {
+              if (menuAntIds[i] == currentAntId()) { menuCursor = i; break; }
+            }
+            menuState = MENU_ANT_SELECT;
           }
-          menuState = MENU_ANT_SELECT;
+          break;
+
+        case MENU_INFO:
+          // Beliebiger Tastendruck → zurück zur Statusanzeige
+          menuState = MENU_STATUS;
           break;
 
         case MENU_ANT_SELECT:
@@ -2636,6 +2875,7 @@ void flexSendLineTo(uint8_t idx, const char *line) {
 // ─── Interlock-Status an alle Clients senden ─────────────────────────────
 
 void flexSendInterlockStatus(bool transmitting) {
+  flexTxActive = transmitting;   // flexTxActive mit tatsächlich gesendetem Zustand synchron halten
   char line[96];
   if (transmitting) {
     snprintf(line, sizeof(line),
@@ -3021,7 +3261,8 @@ void handleFlexSetDefault() {
 static void flexRadioSend(const char *cmd) {
   if (!flexRadioConnected) return;
   char buf[128];
-  snprintf(buf, sizeof(buf), "C%lu|%s\n", flexRadioSeq++, cmd);
+  // SmartSDR TCP/IP API verwendet \r\n als Zeilenende
+  snprintf(buf, sizeof(buf), "C%lu|%s\r\n", flexRadioSeq++, cmd);
   flexRadioClient.print(buf);
   flexRadioClient.flush();
   webLog("[FRINT] >> C%lu|%s", flexRadioSeq - 1, cmd);
@@ -3037,13 +3278,19 @@ void flexRadioProcessLine(const char *line) {
     if (!p1) return;
     const char *p2 = strchr(p1 + 1, '|');
     if (!p2) return;
+    // Fehlercode prüfen: 0x00000000 = OK
     char hexCode[12] = {0};
     strncpy(hexCode, p1 + 1, p2 - p1 - 1);
-    if (strcmp(hexCode, "0") != 0 && strcmp(hexCode, "00000000") != 0) return;
-    int id = atoi(p2 + 1);
+    if (strtoul(hexCode, nullptr, 16) != 0) return;
+    // Interlock-ID ist Hexadezimalwert (z.B. "000000F4") → strtol mit Basis 16
+    long id = strtol(p2 + 1, nullptr, 16);
     if (id > 0) {
-      flexRadioInterlockId = id;
-      webLog("[FRINT] Interlock registriert: ID=%d", flexRadioInterlockId);
+      flexRadioInterlockId = (int32_t)id;
+      webLog("[FRINT] Interlock registriert: ID=0x%08lX", (unsigned long)flexRadioInterlockId);
+      // ANT-Interlock startet laut Doku im ready-Zustand → wir setzen flexRadioInhibit
+      // auf true damit flexRadioSendInterlock(false) nicht als Duplikat unterdrückt wird,
+      // und schicken dann den tatsächlichen Zustand.
+      flexRadioInhibit = true;   // ANT startet als ready → Force-Send des aktuellen Zustands
       flexRadioSendInterlock(conflictActive);
       ssePushStatus();
     }
@@ -3056,13 +3303,14 @@ void flexRadioSendInterlock(bool inhibit) {
   if (!flexRadioConnected || flexRadioInterlockId < 0) return;
   if (flexRadioInhibit == inhibit) return;
   flexRadioInhibit = inhibit;
+  // Interlock-ID als Hexadezimalwert senden (Doku: "interlock ready 000000F4")
   char cmd[48];
   if (inhibit) {
-    snprintf(cmd, sizeof(cmd), "interlock not_ready %d", flexRadioInterlockId);
-    webLog("[FRINT] TX gesperrt → not_ready %d", flexRadioInterlockId);
+    snprintf(cmd, sizeof(cmd), "interlock not_ready %08lX", (unsigned long)flexRadioInterlockId);
+    webLog("[FRINT] TX gesperrt → not_ready 0x%08lX", (unsigned long)flexRadioInterlockId);
   } else {
-    snprintf(cmd, sizeof(cmd), "interlock ready %d", flexRadioInterlockId);
-    webLog("[FRINT] TX freigegeben → ready %d", flexRadioInterlockId);
+    snprintf(cmd, sizeof(cmd), "interlock ready %08lX", (unsigned long)flexRadioInterlockId);
+    webLog("[FRINT] TX freigegeben → ready 0x%08lX", (unsigned long)flexRadioInterlockId);
   }
   flexRadioSend(cmd);
   ssePushStatus();
@@ -3122,9 +3370,12 @@ void flexRadioLoop() {
     flexRadioLineBufLen   = 0;
     webLog("[FRINT] Verbunden. Registriere Interlock...");
     ssePushStatus();
+    // client program: Client-Identifikation (SmartSDR TCP/IP API, nicht im Interlock-Doc)
     flexRadioSend("client program " FLEX_INTERLOCK_NAME);
     char cmd[80];
-    snprintf(cmd, sizeof(cmd), "interlock create type=ANT name=%s serial=%s",
+    // Doku: model=, serial=, valid_antennas= (leer = gilt für alle Antennen)
+    snprintf(cmd, sizeof(cmd),
+             "interlock create type=ANT model=%s serial=%s valid_antennas=",
              FLEX_INTERLOCK_NAME, FLEX_INTERLOCK_SERIAL);
     flexRadioSend(cmd);
     return;
